@@ -168,3 +168,6 @@ tmp/
 wandb
 wandb_logs
 data
+
+Data/
+checkpoints_sr
