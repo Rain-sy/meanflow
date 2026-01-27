@@ -1,24 +1,17 @@
 """
-MeanFlow Super-Resolution - PyTorch Version
+MeanFlow SR 训练脚本 (修复版)
 
-This is a standalone PyTorch implementation that's easier to run
-than the JAX version.
+修复内容：
+1. 移除不合理的 weight = 1/(h+0.01) 加权
+2. 增加 h=1 样本的比例，确保模型能学会 one-step 推理
+3. 添加验证时的 PSNR 监控
 
-Usage:
-    python train_sr_torch.py \
-        --hr_dir "Flow_Restore/Data/Urban 100/X2 Urban100/X2/HIGH X2 Urban" \
-        --lr_dir "Flow_Restore/Data/Urban 100/X2 Urban100/X2/LOW X2 Urban" \
-        --epochs 500 \
-        --batch_size 4
-
-Key Formula:
-    z_t = (1-t) * HR + t * LR     # Interpolation
-    v = LR - HR                    # Instantaneous velocity
-    u = network(z_t, t, h=t-r)    # Predicted average velocity
-    u_target = v - (t-r) * du/dt  # MeanFlow target
-
-One-step inference:
-    HR = LR - u(LR, t=1, h=1)
+用法：
+    python train_sr_fixed.py \
+        --hr_dir "Flow_Restore/Data/DIV2K/DIV2K_train_HR" \
+        --lr_dir "Flow_Restore/Data/DIV2K/DIV2K_train_LR_bicubic/X2" \
+        --epochs 100 \
+        --batch_size 8
 """
 
 import os
@@ -36,23 +29,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
 # =========================================================================
 # Dataset
 # =========================================================================
 
-class Urban100Dataset(Dataset):
-    """Urban100 SR Dataset"""
+class SRDataset(Dataset):
+    """SR Dataset with proper augmentation"""
     
-    def __init__(self, hr_dir, lr_dir, patch_size=128, augment=True):
+    def __init__(self, hr_dir, lr_dir, patch_size=128, augment=True, repeat=5):
         self.hr_dir = hr_dir
         self.lr_dir = lr_dir
         self.patch_size = patch_size
         self.augment = augment
+        self.repeat = repeat
         
-        # Get files
         self.hr_files = sorted([f for f in os.listdir(hr_dir) 
                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
         self.lr_files = sorted([f for f in os.listdir(lr_dir)
@@ -61,16 +53,14 @@ class Urban100Dataset(Dataset):
         assert len(self.hr_files) == len(self.lr_files), \
             f"HR ({len(self.hr_files)}) and LR ({len(self.lr_files)}) count mismatch"
         
-        print(f"[Dataset] Found {len(self.hr_files)} image pairs")
+        print(f"[Dataset] Found {len(self.hr_files)} image pairs (repeat={repeat})")
     
     def __len__(self):
-        # Repeat dataset for more iterations per epoch
-        return len(self.hr_files) * 10
+        return len(self.hr_files) * self.repeat
     
     def __getitem__(self, idx):
         real_idx = idx % len(self.hr_files)
         
-        # Load images
         hr_path = os.path.join(self.hr_dir, self.hr_files[real_idx])
         lr_path = os.path.join(self.lr_dir, self.lr_files[real_idx])
         
@@ -91,12 +81,16 @@ class Urban100Dataset(Dataset):
             if random.random() > 0.5:
                 hr_img = hr_img.transpose(Image.FLIP_TOP_BOTTOM)
                 lr_up = lr_up.transpose(Image.FLIP_TOP_BOTTOM)
+            # Random 90 degree rotation
+            if random.random() > 0.5:
+                k = random.choice([1, 2, 3])
+                hr_img = hr_img.rotate(90 * k)
+                lr_up = lr_up.rotate(90 * k)
         
         # To tensor [-1, 1]
         hr_tensor = torch.from_numpy(np.array(hr_img)).float() / 127.5 - 1.0
         lr_tensor = torch.from_numpy(np.array(lr_up)).float() / 127.5 - 1.0
         
-        # HWC -> CHW
         hr_tensor = hr_tensor.permute(2, 0, 1)
         lr_tensor = lr_tensor.permute(2, 0, 1)
         
@@ -122,11 +116,10 @@ class Urban100Dataset(Dataset):
 
 
 # =========================================================================
-# Model Components
+# Model (same as before)
 # =========================================================================
 
 class SinusoidalPosEmb(nn.Module):
-    """Sinusoidal position embedding for timesteps"""
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -141,7 +134,6 @@ class SinusoidalPosEmb(nn.Module):
 
 
 class ResBlock(nn.Module):
-    """Residual block with time conditioning and channel projection"""
     def __init__(self, in_channels, out_channels, time_dim, dropout=0.1):
         super().__init__()
         
@@ -150,14 +142,12 @@ class ResBlock(nn.Module):
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         
-        # 确保时间嵌入映射到正确的输出维度
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_dim, out_channels * 2),
         )
         self.dropout = nn.Dropout(dropout)
         
-        # 关键修复：如果输入输出通道不一致，使用 1x1 卷积调整 Shortcut
         if in_channels != out_channels:
             self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
         else:
@@ -168,7 +158,6 @@ class ResBlock(nn.Module):
         h = F.silu(h)
         h = self.conv1(h)
         
-        # Time conditioning
         t_proj = self.time_mlp(t_emb)
         scale, shift = t_proj.chunk(2, dim=-1)
         h = h * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
@@ -182,7 +171,6 @@ class ResBlock(nn.Module):
 
 
 class Attention(nn.Module):
-    """Self-attention block"""
     def __init__(self, channels, num_heads=4):
         super().__init__()
         self.num_heads = num_heads
@@ -200,7 +188,6 @@ class Attention(nn.Module):
         qkv = self.qkv(h).reshape(B, 3, self.num_heads, C // self.num_heads, H * W)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
         
-        # Attention
         scale = (C // self.num_heads) ** -0.5
         attn = torch.einsum('bhcn,bhcm->bhnm', q, k) * scale
         attn = attn.softmax(dim=-1)
@@ -213,25 +200,19 @@ class Attention(nn.Module):
 
 
 class MeanFlowSRNet(nn.Module):
-    """
-    MeanFlow SR Network - Robust Channel Matching
-    """
-    
     def __init__(
         self,
         in_channels=3,
         hidden_channels=128,
-        channel_mult=(1, 2, 4, 8), # 假设你的配置可能用到了8，或者是(1,2,4,4)
+        channel_mult=(1, 2, 4, 4),
         num_res_blocks=2,
         attention_resolutions=(16,),
         dropout=0.1,
     ):
         super().__init__()
         
-        # 自动计算时间嵌入维度
         time_dim = hidden_channels * 4
         
-        # Time embedding
         self.time_embed = nn.Sequential(
             SinusoidalPosEmb(hidden_channels),
             nn.Linear(hidden_channels, time_dim),
@@ -246,47 +227,35 @@ class MeanFlowSRNet(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
         
-        # Input
         self.in_conv = nn.Conv2d(in_channels, hidden_channels, 3, padding=1)
         
-        # ----------------------------------------------------------------
-        # 关键修复：预计算 Skip Connection 的通道数栈
-        # ----------------------------------------------------------------
-        # 我们模拟一遍 Encoder 的构建过程，记录下每一次 skips.append() 时张量的通道数
-        skip_ch_stack = [hidden_channels] # 对应 forward 中的 skips = [x]
+        # Build skip channel stack
+        skip_ch_stack = [hidden_channels]
         
-        # Encoder
         self.encoder = nn.ModuleList()
         self.downsample = nn.ModuleList()
         
-        ch = hidden_channels
-        current_ch = ch
+        current_ch = hidden_channels
         
         for i, mult in enumerate(channel_mult):
             out_ch = hidden_channels * mult
             
             blocks = nn.ModuleList()
             for _ in range(num_res_blocks):
-                # Encoder Block
                 blocks.append(ResBlock(current_ch, out_ch, time_dim, dropout))
                 current_ch = out_ch
-                # 记录：每次 Block 输出都会被 append 到 skips
                 skip_ch_stack.append(current_ch)
             
             self.encoder.append(blocks)
             
             if i < len(channel_mult) - 1:
-                # Downsample
                 self.downsample.append(nn.Conv2d(current_ch, current_ch, 3, stride=2, padding=1))
-                # 记录：Downsample 输出也会被 append 到 skips
                 skip_ch_stack.append(current_ch)
         
-        # Middle
         self.mid_block1 = ResBlock(current_ch, current_ch, time_dim, dropout)
         self.mid_attn = Attention(current_ch)
         self.mid_block2 = ResBlock(current_ch, current_ch, time_dim, dropout)
         
-        # Decoder
         self.decoder = nn.ModuleList()
         self.upsample = nn.ModuleList()
         
@@ -294,15 +263,8 @@ class MeanFlowSRNet(nn.Module):
             out_ch = hidden_channels * mult
             
             blocks = nn.ModuleList()
-            
-            # Decoder 每个 Stage 有 num_res_blocks + 1 个块
-            # 这里的 +1 是为了消化掉 Encoder 对应层级产生的额外 skip connection (如 downsample 的输出)
             for j in range(num_res_blocks + 1):
-                # 关键修复：从栈顶弹出一个通道数，这正是当前层将要拼接的 skip connection 的真实大小
                 skip_ch = skip_ch_stack.pop()
-                
-                # 输入维度 = 上一层输出 (current_ch) + 跳跃连接 (skip_ch)
-                # 我们要求 ResBlock 将其融合并输出为该层级的目标维度 (out_ch)
                 blocks.append(ResBlock(current_ch + skip_ch, out_ch, time_dim, dropout))
                 current_ch = out_ch
             
@@ -311,7 +273,6 @@ class MeanFlowSRNet(nn.Module):
             if i > 0:
                 self.upsample.append(nn.ConvTranspose2d(current_ch, current_ch, 4, stride=2, padding=1))
         
-        # Output
         self.out_norm = nn.GroupNorm(8, current_ch)
         self.out_conv = nn.Conv2d(current_ch, in_channels, 3, padding=1)
         
@@ -323,7 +284,6 @@ class MeanFlowSRNet(nn.Module):
         
         x = self.in_conv(x)
         
-        # Encoder
         skips = [x]
         for blocks, down in zip(self.encoder, self.downsample + [None]):
             for block in blocks:
@@ -333,18 +293,14 @@ class MeanFlowSRNet(nn.Module):
                 x = down(x)
                 skips.append(x)
         
-        # Middle
         x = self.mid_block1(x, t_emb)
         x = self.mid_attn(x)
         x = self.mid_block2(x, t_emb)
         
-        # Decoder
         for blocks, up in zip(self.decoder, [None] + list(self.upsample)):
             if up is not None:
                 x = up(x)
             for block in blocks:
-                # 此时 skips.pop() 拿到的 tensor 维度，必然等于我们在 __init__ 中
-                # skip_ch_stack.pop() 记录的数值，因为顺序完全一致。
                 skip = skips.pop()
                 x = torch.cat([x, skip], dim=1)
                 x = block(x, t_emb)
@@ -355,25 +311,31 @@ class MeanFlowSRNet(nn.Module):
         
         return x
 
+
 # =========================================================================
-# MeanFlow SR Trainer
+# Trainer (修复版)
 # =========================================================================
 
 class MeanFlowSRTrainer:
-    """Trainer for MeanFlow SR"""
+    """
+    修复版 Trainer
+    
+    关键修改：
+    1. 移除 weight = 1/(h+0.01) 的不合理加权
+    2. 增加 h 接近 1 的样本比例
+    3. 使用更合理的时间采样策略
+    """
     
     def __init__(
         self,
         model,
         device,
         lr=1e-4,
-        data_proportion=0.75,
         P_mean=-0.4,
         P_std=1.0,
     ):
         self.model = model.to(device)
         self.device = device
-        self.data_proportion = data_proportion
         self.P_mean = P_mean
         self.P_std = P_std
         
@@ -384,36 +346,49 @@ class MeanFlowSRTrainer:
         self.ema_params = {name: param.clone() for name, param in model.named_parameters()}
     
     def update_ema(self):
-        """Update EMA parameters"""
         for name, param in self.model.named_parameters():
             self.ema_params[name].mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
     
     def sample_time(self, batch_size):
-        """Sample t and r with logit-normal distribution"""
-        # Logit-normal
+        """
+        改进的时间采样策略
+        
+        策略：
+        - 50% 样本: t 从 logit-normal 采样, h = t (从 t 直接走到 0，学习完整路径)
+        - 30% 样本: t 从 logit-normal 采样, h 从 uniform(0, t) 采样 (学习部分路径)
+        - 20% 样本: t = 1, h = 1 (专门学习 one-step 推理！)
+        """
+        # 分配比例
+        n_full = int(batch_size * 0.5)      # h = t
+        n_partial = int(batch_size * 0.3)    # h < t
+        n_onestep = batch_size - n_full - n_partial  # t=1, h=1
+        
+        # 采样 t
         rnd = torch.randn(batch_size, device=self.device)
         t = torch.sigmoid(rnd * self.P_std + self.P_mean)
         
-        rnd_r = torch.randn(batch_size, device=self.device)
-        r = torch.sigmoid(rnd_r * self.P_std + self.P_mean)
+        # 采样 h
+        h = torch.zeros(batch_size, device=self.device)
         
-        # Ensure t >= r
-        t, r = torch.max(t, r), torch.min(t, r)
+        # 50%: h = t (完整路径)
+        h[:n_full] = t[:n_full]
         
-        # 75% of samples: r = t
-        data_size = int(batch_size * self.data_proportion)
-        mask = torch.arange(batch_size, device=self.device) < data_size
-        r = torch.where(mask, t, r)
+        # 30%: h ~ uniform(0, t)
+        h[n_full:n_full+n_partial] = torch.rand(n_partial, device=self.device) * t[n_full:n_full+n_partial]
         
-        return t, r
+        # 20%: t = 1, h = 1 (one-step)
+        t[n_full+n_partial:] = 1.0
+        h[n_full+n_partial:] = 1.0
+        
+        return t, h
     
     def train_step(self, batch):
         """
-        MeanFlow training step
+        修复版训练步骤
         
-        z_t = (1-t)*HR + t*LR
-        v = LR - HR
-        u_target ≈ v (simplified for training stability)
+        关键修改：
+        1. 移除 weight = 1/(h+0.01) 加权
+        2. 使用改进的时间采样
         """
         self.model.train()
         
@@ -421,26 +396,24 @@ class MeanFlowSRTrainer:
         lr = batch['lr'].to(self.device)
         batch_size = hr.shape[0]
         
-        # Sample time
-        t, r = self.sample_time(batch_size)
-        h = t - r
+        # 采样时间
+        t, h = self.sample_time(batch_size)
         
-        # Interpolate
+        # 计算 r = t - h
+        r = t - h
+        
+        # 插值得到 z_t
         t_exp = t[:, None, None, None]
         z_t = (1 - t_exp) * hr + t_exp * lr
         
-        # Ground truth velocity
+        # 目标速度 v = LR - HR
         v = lr - hr
         
-        # Forward
+        # 网络预测
         u = self.model(z_t, t, h)
         
-        # Simplified loss (works well in practice)
-        # Weight by 1/(h+eps) to focus on learning v first
-        h_exp = h[:, None, None, None]
-        weight = 1.0 / (h_exp + 0.01)
-        
-        loss = ((u - v) ** 2 * weight).mean()
+        # Loss: MSE without weird weighting
+        loss = ((u - v) ** 2).mean()
         
         # Backward
         self.optimizer.zero_grad()
@@ -448,39 +421,70 @@ class MeanFlowSRTrainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         
-        # Update EMA
         self.update_ema()
         
         return {'loss': loss.item()}
     
     @torch.no_grad()
-    def inference(self, lr_images, use_ema=True):
+    def inference(self, lr_images, num_steps=1, use_ema=True):
         """
-        One-step SR inference
+        SR 推理
         
-        HR = LR - u(LR, t=1, h=1)
+        Args:
+            lr_images: LR 图像 tensor
+            num_steps: 采样步数 (1 = one-step)
+            use_ema: 是否使用 EMA 参数
         """
         self.model.eval()
         
-        # Load EMA params if requested
         if use_ema:
             orig_params = {name: param.clone() for name, param in self.model.named_parameters()}
             for name, param in self.model.named_parameters():
                 param.data.copy_(self.ema_params[name])
         
         batch_size = lr_images.shape[0]
-        t = torch.ones(batch_size, device=self.device)
-        h = torch.ones(batch_size, device=self.device)
+        x = lr_images
         
-        u = self.model(lr_images, t, h)
-        hr = lr_images - u
+        dt = 1.0 / num_steps
         
-        # Restore original params
+        for i in range(num_steps):
+            t_current = 1.0 - i * dt
+            
+            t = torch.full((batch_size,), t_current, device=self.device)
+            h = torch.full((batch_size,), dt, device=self.device)
+            
+            u = self.model(x, t, h)
+            x = x - dt * u
+        
         if use_ema:
             for name, param in self.model.named_parameters():
                 param.data.copy_(orig_params[name])
         
-        return hr
+        return x
+    
+    @torch.no_grad()
+    def validate(self, val_loader, num_steps=1):
+        """验证并计算 PSNR"""
+        self.model.eval()
+        
+        psnr_list = []
+        
+        for batch in val_loader:
+            hr = batch['hr'].to(self.device)
+            lr = batch['lr'].to(self.device)
+            
+            hr_pred = self.inference(lr, num_steps=num_steps, use_ema=True)
+            
+            # 计算 PSNR (在 [0, 1] 范围)
+            hr_01 = (hr + 1) / 2
+            hr_pred_01 = (hr_pred + 1) / 2
+            hr_pred_01 = hr_pred_01.clamp(0, 1)
+            
+            mse = ((hr_01 - hr_pred_01) ** 2).mean(dim=[1, 2, 3])
+            psnr = 10 * torch.log10(1.0 / (mse + 1e-8))
+            psnr_list.extend(psnr.cpu().tolist())
+        
+        return np.mean(psnr_list)
 
 
 # =========================================================================
@@ -488,23 +492,26 @@ class MeanFlowSRTrainer:
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='MeanFlow SR Training (PyTorch)')
-    parser.add_argument('--hr_dir', type=str, required=True, help='HR images directory')
-    parser.add_argument('--lr_dir', type=str, required=True, help='LR images directory')
-    parser.add_argument('--epochs', type=int, default=500)
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser = argparse.ArgumentParser(description='MeanFlow SR Training (Fixed)')
+    parser.add_argument('--hr_dir', type=str, required=True)
+    parser.add_argument('--lr_dir', type=str, required=True)
+    parser.add_argument('--val_hr_dir', type=str, default=None, help='Validation HR dir')
+    parser.add_argument('--val_lr_dir', type=str, default=None, help='Validation LR dir')
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--patch_size', type=int, default=128)
-    parser.add_argument('--save_dir', type=str, default='./checkpoints_sr')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints_sr_fixed')
     parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
     
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    #device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    device = torch.device(2)
     os.makedirs(args.save_dir, exist_ok=True)
     
     print("="*60)
-    print("MeanFlow Super-Resolution Training (PyTorch)")
+    print("MeanFlow SR Training (Fixed Version)")
     print("="*60)
     print(f"Device: {device}")
     print(f"HR dir: {args.hr_dir}")
@@ -513,12 +520,13 @@ def main():
     print(f"Patch size: {args.patch_size}")
     print("="*60)
     
-    # Create dataset
-    dataset = Urban100Dataset(
+    # Dataset
+    dataset = SRDataset(
         hr_dir=args.hr_dir,
         lr_dir=args.lr_dir,
         patch_size=args.patch_size,
         augment=True,
+        repeat=5,
     )
     
     loader = DataLoader(
@@ -529,7 +537,20 @@ def main():
         pin_memory=True,
     )
     
-    # Create model
+    # Validation dataset (optional)
+    val_loader = None
+    if args.val_hr_dir and args.val_lr_dir:
+        val_dataset = SRDataset(
+            hr_dir=args.val_hr_dir,
+            lr_dir=args.val_lr_dir,
+            patch_size=args.patch_size,
+            augment=False,
+            repeat=1,
+        )
+        val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2)
+        print(f"Validation set: {len(val_dataset)} samples")
+    
+    # Model
     model = MeanFlowSRNet(
         in_channels=3,
         hidden_channels=128,
@@ -541,16 +562,13 @@ def main():
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
     
-    # Create trainer
-    trainer = MeanFlowSRTrainer(
-        model=model,
-        device=device,
-        lr=args.lr,
-    )
+    # Trainer
+    trainer = MeanFlowSRTrainer(model=model, device=device, lr=args.lr)
     
-    # Training loop
+    # Training
     print(f"\nStarting training for {args.epochs} epochs...")
     
+    best_psnr = 0
     best_loss = float('inf')
     
     for epoch in range(args.epochs):
@@ -563,57 +581,49 @@ def main():
             pbar.set_postfix({'loss': f"{metrics['loss']:.4f}"})
         
         avg_loss = np.mean(losses)
-        print(f"Epoch {epoch+1}: Loss = {avg_loss:.6f}")
         
-        # Save best
-        if avg_loss < best_loss:
+        # Validation
+        val_psnr_1step = 0
+        val_psnr_10step = 0
+        if val_loader:
+            val_psnr_1step = trainer.validate(val_loader, num_steps=1)
+            val_psnr_10step = trainer.validate(val_loader, num_steps=10)
+            print(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, Val PSNR (1-step)={val_psnr_1step:.2f}dB, (10-step)={val_psnr_10step:.2f}dB")
+        else:
+            print(f"Epoch {epoch+1}: Loss={avg_loss:.6f}")
+        
+        # Save best (by loss or PSNR)
+        save_best = False
+        if val_loader and val_psnr_1step > best_psnr:
+            best_psnr = val_psnr_1step
+            save_best = True
+        elif not val_loader and avg_loss < best_loss:
             best_loss = avg_loss
+            save_best = True
+        
+        if save_best:
             torch.save({
                 'epoch': epoch,
                 'model': model.state_dict(),
                 'ema': trainer.ema_params,
                 'optimizer': trainer.optimizer.state_dict(),
                 'loss': avg_loss,
+                'psnr_1step': val_psnr_1step,
+                'psnr_10step': val_psnr_10step,
             }, os.path.join(args.save_dir, 'best_model.pt'))
-            print(f"  Saved best model (loss={avg_loss:.6f})")
+            print(f"  Saved best model!")
         
-        # Save checkpoint periodically
-        if (epoch + 1) % 50 == 0:
+        # Periodic checkpoint
+        if (epoch + 1) % 20 == 0:
             torch.save({
                 'epoch': epoch,
                 'model': model.state_dict(),
                 'ema': trainer.ema_params,
                 'optimizer': trainer.optimizer.state_dict(),
             }, os.path.join(args.save_dir, f'checkpoint_epoch{epoch+1}.pt'))
-        
-        # Visualization every 20 epochs
-        if (epoch + 1) % 20 == 0:
-            # Get a batch
-            test_batch = next(iter(loader))
-            lr_test = test_batch['lr'].to(device)
-            hr_test = test_batch['hr'].to(device)
-            
-            hr_pred = trainer.inference(lr_test, use_ema=True)
-            
-            # Compute PSNR
-            mse = ((hr_pred - hr_test) ** 2).mean()
-            psnr = 10 * torch.log10(4.0 / (mse + 1e-8))  # range is [-1,1] so max diff is 2
-            print(f"  Sample PSNR: {psnr.item():.2f} dB")
-            
-            # Save sample images
-            sample_dir = os.path.join(args.save_dir, 'samples')
-            os.makedirs(sample_dir, exist_ok=True)
-            
-            # Save first image
-            lr_img = ((lr_test[0].cpu().permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
-            hr_img = ((hr_test[0].cpu().permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
-            pred_img = ((hr_pred[0].cpu().permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
-            
-            # Concatenate: LR | Pred | HR
-            combined = np.concatenate([lr_img, pred_img, hr_img], axis=1)
-            Image.fromarray(combined).save(os.path.join(sample_dir, f'epoch{epoch+1}.png'))
     
-    print(f"\nTraining complete! Best loss: {best_loss:.6f}")
+    print(f"\nTraining complete!")
+    print(f"Best 1-step PSNR: {best_psnr:.2f} dB")
     print(f"Checkpoints saved to: {args.save_dir}")
 
 

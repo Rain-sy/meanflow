@@ -170,4 +170,5 @@ wandb_logs
 data
 
 Data/
-checkpoints_sr
+checkpoints_sr/
+eval_results/
