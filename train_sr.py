@@ -506,8 +506,8 @@ def main():
     
     args = parser.parse_args()
     
-    #device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    device = torch.device(2)
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    #device = torch.device(1)
     os.makedirs(args.save_dir, exist_ok=True)
     
     print("="*60)
