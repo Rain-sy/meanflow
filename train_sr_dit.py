@@ -1,21 +1,24 @@
 """
-MeanFlow-DiT v2: Improved Training with Proper MeanFlow Loss
+MeanFlow-DiT V3: Fixed Training Strategy
 
-Key improvements over v1:
-    1. JVP-based loss computation: u_tgt = v - h * du/dt
-    2. Correct time sampling: 75% h=0 (instantaneous), 25% h>0 (average)
-    3. Adaptive loss weighting: loss / (loss + eps)
-    4. Logit-normal time distribution (matching original MeanFlow)
+Key fixes over V2:
+    1. Time sampling includes t=1, h=1 samples (20%) - CRITICAL!
+    2. Simple MSE loss (no JVP) - matches successful UNet version
+    3. Proper time distribution for one-step inference
 
-Reference: Original MeanFlow implementation (JAX/Flax)
+Time sampling strategy:
+    - 60%: h = 0, t ~ logit-normal (instantaneous velocity)
+    - 20%: h > 0, t ~ logit-normal (average velocity)
+    - 20%: t = 1, h = 1 (for one-step inference) ← CRITICAL
 
 Usage:
-    python train_meanflow_dit_v2.py \
+    python train_meanflow_dit_v3.py \
         --hr_dir Flow_Restore/Data/DIV2K/DIV2K_train_HR \
         --lr_dir Flow_Restore/Data/DIV2K/DIV2K_train_LR_bicubic/X2 \
+        --val_hr_dir Flow_Restore/Data/DIV2K/DIV2K_valid_HR \
+        --val_lr_dir Flow_Restore/Data/DIV2K/DIV2K_valid_LR_bicubic/X2 \
         --epochs 100 \
         --batch_size 8 \
-        --patch_size 128 \
         --model_size small
 """
 
@@ -23,7 +26,6 @@ import os
 import math
 import random
 import argparse
-from datetime import datetime
 
 import numpy as np
 from PIL import Image
@@ -282,29 +284,35 @@ MODEL_CONFIGS = {'xs': MeanFlowDiT_XS, 'small': MeanFlowDiT_S, 'base': MeanFlowD
 
 
 # ============================================================================
-# MeanFlow Trainer V2 - with proper loss
+# Trainer V3 - Fixed Time Sampling
 # ============================================================================
 
-class MeanFlowDiTTrainerV2:
+class MeanFlowDiTTrainerV3:
     """
-    MeanFlow-DiT Trainer V2 with proper MeanFlow loss
+    MeanFlow-DiT Trainer V3 with fixed time sampling
     
-    Key improvements:
-        1. JVP-based loss: u_tgt = v - h * du/dt
-        2. Time sampling: 75% h=0, 25% h>0 (matching original MeanFlow)
-        3. Adaptive loss weighting
-        4. Logit-normal time distribution
+    Key fix: Include t=1, h=1 samples for one-step inference!
+    
+    Time sampling:
+        - 60%: h=0, t~logit-normal (instantaneous velocity)
+        - 20%: h>0, t~logit-normal (average velocity)
+        - 20%: t=1, h=1 (one-step inference) ← CRITICAL!
+    
+    Loss: Simple MSE(u, v) - same as successful UNet
     """
     
     def __init__(self, model, device, lr=1e-4, weight_decay=0.01,
-                 data_proportion=0.75, P_mean=-0.4, P_std=1.0, norm_eps=0.01, use_jvp_loss=True):
+                 P_mean=-0.4, P_std=1.0,
+                 prop_h0=0.6, prop_havg=0.2, prop_onestep=0.2):
         self.model = model.to(device)
         self.device = device
-        self.data_proportion = data_proportion
         self.P_mean = P_mean
         self.P_std = P_std
-        self.norm_eps = norm_eps
-        self.use_jvp_loss = use_jvp_loss
+        
+        assert abs(prop_h0 + prop_havg + prop_onestep - 1.0) < 1e-6
+        self.prop_h0 = prop_h0
+        self.prop_havg = prop_havg
+        self.prop_onestep = prop_onestep
         
         self.optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
         self.ema_decay = 0.9999
@@ -316,104 +324,55 @@ class MeanFlowDiTTrainerV2:
                 self.ema_params[name].mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
     
     def sample_time(self, batch_size):
-        """
-        Sample (t, h) following original MeanFlow:
-        - Logit-normal distribution for t and r
-        - 75% samples: h = 0 (instantaneous velocity)
-        - 25% samples: h > 0 (average velocity)
-        """
-        # Logit-normal sampling
-        rnd_t = torch.randn(batch_size, device=self.device)
-        t = torch.sigmoid(rnd_t * self.P_std + self.P_mean)
+        """Sample (t, h) with dedicated one-step samples"""
+        n_h0 = int(batch_size * self.prop_h0)
+        n_havg = int(batch_size * self.prop_havg)
+        n_onestep = batch_size - n_h0 - n_havg
         
-        rnd_r = torch.randn(batch_size, device=self.device)
-        r = torch.sigmoid(rnd_r * self.P_std + self.P_mean)
+        t = torch.zeros(batch_size, device=self.device)
+        h = torch.zeros(batch_size, device=self.device)
         
-        # Ensure t >= r
-        t, r = torch.maximum(t, r), torch.minimum(t, r)
+        # Group 1: h=0 (instantaneous)
+        if n_h0 > 0:
+            rnd = torch.randn(n_h0, device=self.device)
+            t[:n_h0] = torch.sigmoid(rnd * self.P_std + self.P_mean)
+            h[:n_h0] = 0.0
         
-        # 75% h=0, 25% h>0
-        data_size = int(batch_size * self.data_proportion)
-        mask = torch.arange(batch_size, device=self.device) < data_size
-        r = torch.where(mask, t, r)
+        # Group 2: h>0 (average)
+        if n_havg > 0:
+            idx = n_h0
+            rnd_t = torch.randn(n_havg, device=self.device)
+            rnd_r = torch.randn(n_havg, device=self.device)
+            t_tmp = torch.sigmoid(rnd_t * self.P_std + self.P_mean)
+            r_tmp = torch.sigmoid(rnd_r * self.P_std + self.P_mean)
+            t_tmp, r_tmp = torch.maximum(t_tmp, r_tmp), torch.minimum(t_tmp, r_tmp)
+            t[idx:idx+n_havg] = t_tmp
+            h[idx:idx+n_havg] = t_tmp - r_tmp
         
-        h = t - r  # h = 0 for first 75%, h > 0 for rest
-        return t, h
-    
-    def compute_loss(self, hr, lr):
-        """
-        Compute MeanFlow loss with JVP
+        # Group 3: t=1, h=1 (one-step) - CRITICAL!
+        if n_onestep > 0:
+            idx = n_h0 + n_havg
+            t[idx:] = 1.0
+            h[idx:] = 1.0
         
-        u_tgt = v - h * du/dt
-        
-        For h=0: u_tgt = v (instantaneous velocity)
-        For h>0: u_tgt = v - h * du/dt (corrected average velocity)
-        """
-        batch_size = hr.shape[0]
-        
-        # Sample time
-        t, h = self.sample_time(batch_size)
-        
-        # Expand for broadcasting
-        t_exp = t[:, None, None, None]
-        h_exp = h[:, None, None, None]
-        
-        # Interpolate: z_t = (1-t) * HR + t * LR
-        z_t = (1 - t_exp) * hr + t_exp * lr
-        
-        # Target velocity: v = LR - HR
-        v = lr - hr
-        
-        # Forward pass
-        u = self.model(z_t, t, h)
-        
-        if self.use_jvp_loss and (h > 1e-6).any():
-            # Compute du/dt using finite difference for h > 0 samples
-            eps = 1e-4
-            
-            with torch.no_grad():
-                # z_t changes with t: dz_t/dt = LR - HR = v
-                t_plus = t + eps
-                t_plus_exp = t_plus[:, None, None, None]
-                z_t_plus = (1 - t_plus_exp) * hr + t_plus_exp * lr
-                
-                t_minus = t - eps
-                t_minus_exp = t_minus[:, None, None, None]
-                z_t_minus = (1 - t_minus_exp) * hr + t_minus_exp * lr
-            
-            # Forward at t+eps and t-eps
-            u_plus = self.model(z_t_plus, t_plus, h)
-            u_minus = self.model(z_t_minus, t_minus, h)
-            
-            # du/dt ≈ (u(t+eps) - u(t-eps)) / (2*eps)
-            du_dt = (u_plus - u_minus) / (2 * eps)
-            
-            # Target: u_tgt = v - h * du/dt
-            u_tgt = v - h_exp * du_dt
-            u_tgt = u_tgt.detach()
-        else:
-            # Simple case: all h ≈ 0, target is just v
-            u_tgt = v
-        
-        # Loss per sample (sum over pixels)
-        loss_per_sample = ((u - u_tgt) ** 2).sum(dim=(1, 2, 3))
-        
-        # Adaptive weighting (matching original MeanFlow)
-        with torch.no_grad():
-            adp_wt = loss_per_sample.detach() + self.norm_eps
-        loss_weighted = loss_per_sample / adp_wt
-        
-        # v_loss for monitoring (how close is u to v)
-        v_loss = ((u - v) ** 2).sum(dim=(1, 2, 3)).mean()
-        
-        return loss_weighted.mean(), v_loss, h.mean(), (h > 1e-6).float().mean()
+        # Shuffle
+        perm = torch.randperm(batch_size, device=self.device)
+        return t[perm], h[perm]
     
     def train_step(self, batch):
         self.model.train()
         hr = batch['hr'].to(self.device)
         lr = batch['lr'].to(self.device)
+        batch_size = hr.shape[0]
         
-        loss, v_loss, h_mean, h_nz_ratio = self.compute_loss(hr, lr)
+        t, h = self.sample_time(batch_size)
+        t_exp = t[:, None, None, None]
+        
+        z_t = (1 - t_exp) * hr + t_exp * lr
+        v = lr - hr
+        
+        u = self.model(z_t, t, h)
+        loss = F.mse_loss(u, v)
         
         self.optimizer.zero_grad()
         loss.backward()
@@ -423,10 +382,9 @@ class MeanFlowDiTTrainerV2:
         
         return {
             'loss': loss.item(),
-            'v_loss': v_loss.item(),
-            'h_mean': h_mean.item(),
-            'h_nz_ratio': h_nz_ratio.item(),
             'grad_norm': grad_norm.item(),
+            't_mean': t.mean().item(),
+            'h_mean': h.mean().item(),
         }
     
     @torch.no_grad()
@@ -443,11 +401,9 @@ class MeanFlowDiTTrainerV2:
         dt = 1.0 / num_steps
         
         for i in range(num_steps):
-            t_val = 1.0 - i * dt
-            t = torch.full((batch_size,), t_val, device=self.device)
+            t = torch.full((batch_size,), 1.0 - i * dt, device=self.device)
             h = torch.full((batch_size,), dt, device=self.device)
-            u = self.model(x, t, h)
-            x = x - dt * u
+            x = x - dt * self.model(x, t, h)
         
         if use_ema:
             for name, param in self.model.named_parameters():
@@ -457,20 +413,17 @@ class MeanFlowDiTTrainerV2:
     
     @torch.no_grad()
     def validate(self, val_loader, num_steps=1):
-        self.model.eval()
         psnr_list = []
-        
         for batch in val_loader:
             hr = batch['hr'].to(self.device)
             lr = batch['lr'].to(self.device)
-            hr_pred = self.inference(lr, num_steps=num_steps, use_ema=True)
+            hr_pred = self.inference(lr, num_steps, use_ema=True)
             
             hr_01 = (hr + 1) / 2
             hr_pred_01 = ((hr_pred + 1) / 2).clamp(0, 1)
             mse = ((hr_01 - hr_pred_01) ** 2).mean(dim=[1, 2, 3])
             psnr = 10 * torch.log10(1.0 / (mse + 1e-8))
             psnr_list.extend(psnr.cpu().tolist())
-        
         return np.mean(psnr_list)
     
     def save_checkpoint(self, path, epoch, loss, psnr_1step=0, psnr_10step=0):
@@ -499,7 +452,7 @@ class MeanFlowDiTTrainerV2:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='MeanFlow-DiT V2 Training')
+    parser = argparse.ArgumentParser(description='MeanFlow-DiT V3')
     
     parser.add_argument('--hr_dir', type=str, required=True)
     parser.add_argument('--lr_dir', type=str, required=True)
@@ -515,14 +468,11 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     
-    # MeanFlow hyperparameters
-    parser.add_argument('--data_proportion', type=float, default=0.75, help='Proportion of h=0 samples')
-    parser.add_argument('--P_mean', type=float, default=-0.4, help='Logit-normal mean')
-    parser.add_argument('--P_std', type=float, default=1.0, help='Logit-normal std')
-    parser.add_argument('--norm_eps', type=float, default=0.01, help='Adaptive weighting epsilon')
-    parser.add_argument('--no_jvp', action='store_true', help='Disable JVP loss')
+    parser.add_argument('--prop_h0', type=float, default=0.6)
+    parser.add_argument('--prop_havg', type=float, default=0.2)
+    parser.add_argument('--prop_onestep', type=float, default=0.2)
     
-    parser.add_argument('--save_dir', type=str, default='./checkpoints_dit_v2')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints_dit_v3')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--resume', type=str, default=None)
@@ -534,14 +484,11 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     
     print("="*70)
-    print("MeanFlow-DiT V2 Training")
+    print("MeanFlow-DiT V3 (Fixed Time Sampling)")
     print("="*70)
     print(f"Device: {device}")
     print(f"Model: {args.model_size}, Patch: {args.patch_size}")
-    print(f"Batch: {args.batch_size}, LR: {args.lr}")
-    print(f"Data proportion (h=0): {args.data_proportion}")
-    print(f"Logit-normal: mean={args.P_mean}, std={args.P_std}")
-    print(f"JVP loss: {'Disabled' if args.no_jvp else 'Enabled'}")
+    print(f"Time sampling: {args.prop_h0*100:.0f}% h=0, {args.prop_havg*100:.0f}% h>0, {args.prop_onestep*100:.0f}% t=1,h=1")
     print("="*70)
     
     train_dataset = SRDataset(args.hr_dir, args.lr_dir, args.patch_size, args.scale, True, 5)
@@ -556,11 +503,9 @@ def main():
     model = MODEL_CONFIGS[args.model_size](img_size=args.patch_size)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    trainer = MeanFlowDiTTrainerV2(
-        model, device, args.lr, args.weight_decay,
-        args.data_proportion, args.P_mean, args.P_std, args.norm_eps,
-        use_jvp_loss=not args.no_jvp
-    )
+    trainer = MeanFlowDiTTrainerV3(model, device, args.lr, args.weight_decay,
+                                    prop_h0=args.prop_h0, prop_havg=args.prop_havg, 
+                                    prop_onestep=args.prop_onestep)
     
     start_epoch = 0
     if args.resume:
@@ -570,45 +515,36 @@ def main():
     scheduler = CosineAnnealingLR(trainer.optimizer, T_max=args.epochs, eta_min=1e-6)
     
     best_psnr = 0
-    best_loss = float('inf')
     global_step = start_epoch * len(train_loader)
     
     for epoch in range(start_epoch, args.epochs):
-        losses, v_losses = [], []
+        losses = []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         
         for batch in pbar:
             metrics = trainer.train_step(batch)
             losses.append(metrics['loss'])
-            v_losses.append(metrics['v_loss'])
             global_step += 1
             
-            pbar.set_postfix({
-                'loss': f"{metrics['loss']:.4f}",
-                'v_loss': f"{metrics['v_loss']:.4f}",
-                'h_nz': f"{metrics['h_nz_ratio']:.2f}"
-            })
+            pbar.set_postfix({'loss': f"{metrics['loss']:.4f}", 't': f"{metrics['t_mean']:.2f}", 'h': f"{metrics['h_mean']:.2f}"})
             
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                 trainer.save_checkpoint(os.path.join(args.save_dir, 'checkpoint_latest.pt'), epoch, metrics['loss'])
         
         avg_loss = np.mean(losses)
-        avg_v_loss = np.mean(v_losses)
         
         val_psnr_1step, val_psnr_10step = 0, 0
         if val_loader:
             val_psnr_1step = trainer.validate(val_loader, num_steps=1)
             val_psnr_10step = trainer.validate(val_loader, num_steps=10)
-            print(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, V_Loss={avg_v_loss:.4f}, "
-                  f"PSNR 1-step={val_psnr_1step:.2f}dB, 10-step={val_psnr_10step:.2f}dB")
+            print(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR 1-step={val_psnr_1step:.2f}dB, 10-step={val_psnr_10step:.2f}dB")
         else:
-            print(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, V_Loss={avg_v_loss:.4f}")
+            print(f"Epoch {epoch+1}: Loss={avg_loss:.6f}")
         
         scheduler.step()
         
-        if (val_loader and val_psnr_1step > best_psnr) or (not val_loader and avg_loss < best_loss):
-            best_psnr = val_psnr_1step if val_loader else best_psnr
-            best_loss = avg_loss if not val_loader else best_loss
+        if val_loader and val_psnr_1step > best_psnr:
+            best_psnr = val_psnr_1step
             trainer.save_checkpoint(os.path.join(args.save_dir, 'best_model.pt'), epoch, avg_loss, val_psnr_1step, val_psnr_10step)
             print("  Saved best!")
         
