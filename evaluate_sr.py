@@ -253,6 +253,8 @@ def run_sr_direct(model, lr_tensor, device, num_steps=1, pad_multiple=8):
 def run_sr_tiled(model, lr_tensor, device, num_steps=1, tile_size=256, overlap=64, pad_multiple=8):
     """
     Run SR with tiling for large images
+    
+    Fixed: Only apply blend weight reduction at overlap regions, not at image boundaries
     """
     _, _, H, W = lr_tensor.shape
     
@@ -277,16 +279,6 @@ def run_sr_tiled(model, lr_tensor, device, num_steps=1, tile_size=256, overlap=6
         w_starts = [0]
     if w_starts[-1] + tile_size < W:
         w_starts.append(max(0, W - tile_size))
-    
-    # Create blending weights (linear ramp at edges)
-    blend_weight = torch.ones(1, 1, tile_size, tile_size, device=device)
-    if overlap > 0:
-        for i in range(overlap):
-            ratio = i / overlap
-            blend_weight[:, :, i, :] *= ratio
-            blend_weight[:, :, tile_size - 1 - i, :] *= ratio
-            blend_weight[:, :, :, i] *= ratio
-            blend_weight[:, :, :, tile_size - 1 - i] *= ratio
     
     for h_start in h_starts:
         for w_start in w_starts:
@@ -322,7 +314,31 @@ def run_sr_tiled(model, lr_tensor, device, num_steps=1, tile_size=256, overlap=6
             
             # Get actual tile output (remove size padding)
             tile_output = x[:, :, :th, :tw]
-            tile_weight = blend_weight[:, :, :th, :tw]
+            
+            # Create tile-specific blending weight
+            # Only reduce weight at edges that overlap with OTHER tiles, not image boundaries
+            tile_weight = torch.ones(1, 1, th, tw, device=device)
+            
+            if overlap > 0:
+                # Top edge: reduce weight only if NOT at image top boundary
+                if h_start > 0:
+                    for i in range(min(overlap, th)):
+                        tile_weight[:, :, i, :] *= i / overlap
+                
+                # Bottom edge: reduce weight only if NOT at image bottom boundary
+                if h_end < H:
+                    for i in range(min(overlap, th)):
+                        tile_weight[:, :, th - 1 - i, :] *= i / overlap
+                
+                # Left edge: reduce weight only if NOT at image left boundary
+                if w_start > 0:
+                    for i in range(min(overlap, tw)):
+                        tile_weight[:, :, :, i] *= i / overlap
+                
+                # Right edge: reduce weight only if NOT at image right boundary
+                if w_end < W:
+                    for i in range(min(overlap, tw)):
+                        tile_weight[:, :, :, tw - 1 - i] *= i / overlap
             
             output[:, :, h_start:h_end, w_start:w_end] += tile_output * tile_weight
             weight[:, :, h_start:h_end, w_start:w_end] += tile_weight

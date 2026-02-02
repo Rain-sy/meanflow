@@ -9,11 +9,11 @@ Key Features:
 4. PixelShuffle Upsampling: Reduced checkerboard artifacts.
 
 Usage Example:
-    python train_meanflow_dit_uvit.py \
-        --hr_dir Flow_Restore/Data/DIV2K/DIV2K_train_HR \
-        --lr_dir Flow_Restore/Data/DIV2K/DIV2K_train_LR_bicubic/X2 \
-        --val_hr_dir Flow_Restore/Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Flow_Restore/Data/DIV2K/DIV2K_valid_LR_bicubic/X2 \
+    python meanflow/train_sr_ditu.py \
+        --hr_dir meanflow/Data/DIV2K/DIV2K_train_HR \
+        --lr_dir meanflow/Data/DIV2K/DIV2K_train_LR_bicubic_X2 \
+        --val_hr_dir meanflow/Data/DIV2K/DIV2K_valid_HR \
+        --val_lr_dir meanflow/Data/DIV2K/DIV2K_valid_LR_bicubic_X2 \
         --model_size small \
         --batch_size 8 \
         --epochs 100 \
@@ -166,9 +166,34 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        
+        # Self-Attention
         x_norm = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        
+        # --- FIX: Use PyTorch Scaled Dot Product Attention (FlashAttention) ---
+        # Instead of self.attn(x, x, x), use the functional API which is memory efficient
+        q, k, v = self.attn.in_proj_weight.split(self.attn.embed_dim, dim=0)
+        q = F.linear(x_norm, q, self.attn.in_proj_bias[:self.attn.embed_dim])
+        k = F.linear(x_norm, k, self.attn.in_proj_bias[self.attn.embed_dim:2*self.attn.embed_dim])
+        v = F.linear(x_norm, v, self.attn.in_proj_bias[2*self.attn.embed_dim:])
+        
+        # Reshape for multi-head: (B, L, H, D) -> (B, H, L, D)
+        B, L, _ = x_norm.shape
+        q = q.view(B, L, self.attn.num_heads, -1).transpose(1, 2)
+        k = k.view(B, L, self.attn.num_heads, -1).transpose(1, 2)
+        v = v.view(B, L, self.attn.num_heads, -1).transpose(1, 2)
+        
+        # This function automatically selects FlashAttention if available
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        
+        # Reshape back: (B, H, L, D) -> (B, L, H*D)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, -1)
+        attn_out = self.attn.out_proj(attn_out)
+        # ----------------------------------------------------------------------
+
         x = x + gate_msa.unsqueeze(1) * attn_out
+        
+        # MLP
         x_norm = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
         return x
