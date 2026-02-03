@@ -14,9 +14,9 @@ Time sampling strategy:
 Usage:
     python train_meanflow_dit_v3.py \
         --hr_dir Flow_Restore/Data/DIV2K/DIV2K_train_HR \
-        --lr_dir Flow_Restore/Data/DIV2K/DIV2K_train_LR_bicubic/X2 \
+        --lr_dir Flow_Restore/Data/DIV2K/DIV2K_train_LR_bicubic_X2 \
         --val_hr_dir Flow_Restore/Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Flow_Restore/Data/DIV2K/DIV2K_valid_LR_bicubic/X2 \
+        --val_lr_dir Flow_Restore/Data/DIV2K/DIV2K_valid_LR_bicubic_X2 \
         --epochs 100 \
         --batch_size 8 \
         --model_size small
@@ -472,7 +472,10 @@ def main():
     parser.add_argument('--prop_havg', type=float, default=0.2)
     parser.add_argument('--prop_onestep', type=float, default=0.2)
     
-    parser.add_argument('--save_dir', type=str, default='./checkpoints_dit_v3')
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='Save directory (auto-generated if not specified)')
+    parser.add_argument('--save_base', type=str, default='./checkpoints_dit_v3',
+                        help='Base directory for auto-generated save paths')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--resume', type=str, default=None)
@@ -481,6 +484,16 @@ def main():
     args = parser.parse_args()
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    
+    # Auto-generate save_dir if not specified
+    if args.save_dir is None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.save_dir = os.path.join(
+            args.save_base,
+            f"{timestamp}_{args.model_size}_x{args.scale}_bs{args.batch_size}_ps{args.patch_size}"
+        )
+    
     os.makedirs(args.save_dir, exist_ok=True)
     
     print("="*70)
@@ -488,7 +501,10 @@ def main():
     print("="*70)
     print(f"Device: {device}")
     print(f"Model: {args.model_size}, Patch: {args.patch_size}")
+    print(f"Scale: {args.scale}x")
+    print(f"Batch size: {args.batch_size}")
     print(f"Time sampling: {args.prop_h0*100:.0f}% h=0, {args.prop_havg*100:.0f}% h>0, {args.prop_onestep*100:.0f}% t=1,h=1")
+    print(f"Save directory: {args.save_dir}")
     print("="*70)
     
     train_dataset = SRDataset(args.hr_dir, args.lr_dir, args.patch_size, args.scale, True, 5)
