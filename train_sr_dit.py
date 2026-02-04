@@ -438,7 +438,7 @@ class MeanFlowDiTTrainerV3:
         }, path)
     
     def load_checkpoint(self, path):
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(ckpt['model'])
         if 'ema' in ckpt:
             self.ema_params = ckpt['ema']

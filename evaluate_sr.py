@@ -29,14 +29,16 @@ Usage:
         --num_steps 1
 
     # DiT model with tiling
-    python evaluate_sr.py \\
-        --checkpoint checkpoints_dit/best_model.pt \\
-        --hr_dir "..." \\
-        --lr_dir "..." \\
-        --model_type dit \\
-        --model_size small \\
-        --tile_size 128 \\
-        --num_steps 1
+    python meanflow/evaluate_sr.py \
+        --checkpoint checkpoints_dit_v3_x4/best_model.pt \
+        --hr_dir meanflow/Data/DIV2K/DIV2K_valid_HR \
+        --lr_dir meanflow/Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
+        --model_type dit \
+        --model_size small \
+        --scale 4 \
+        --tile_size 128 \
+        --num_steps 1 \
+        --device cuda:0
 
     # No tiling (small images or large GPU)
     python evaluate_sr.py \\
