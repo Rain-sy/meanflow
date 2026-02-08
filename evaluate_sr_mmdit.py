@@ -1,20 +1,29 @@
 """
-MeanFlow-MMDiT Evaluation (Unified: Pixel + Latent)
+MeanFlow-MMDiT Evaluation
 
-Auto-detects mode from checkpoint or uses --mode flag.
+Output structure:
+    outputs/
+    └── DIV2K/
+        └── MMDiT_small_1step_x4/
+            ├── predictions/
+            ├── comparisons/
+            └── results.txt
 
 Usage:
     python evaluate_sr_mmdit.py \
-        --checkpoint checkpoints_mmdit/xxx/best.pt \
+        --checkpoint checkpoints_mmdit/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --model_size small \
-        --scale 4
-        python evaluate_sr_mmdit.py --mode pixel ...
-python evaluate_sr_mmdit.py --mode latent --vae_type flux ...
+        --scale 4 \
+        --num_steps 1
 """
 
-import os, math, argparse
+import os
+import math
+import argparse
+from datetime import datetime
+
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -25,30 +34,60 @@ import torch.nn.functional as F
 
 
 # ============================================================================
-# VAE Wrapper
+# Metrics
 # ============================================================================
 
-class VAEWrapper:
-    def __init__(self, vae_type='flux', device='cuda'):
-        self.vae_type, self.device = vae_type, device
-        from diffusers import AutoencoderKL
-        model_id = "stabilityai/stable-diffusion-3-medium-diffusers" if vae_type == 'sd3' else "black-forest-labs/FLUX.1-dev"
-        print(f"Loading {vae_type.upper()} VAE...")
-        self.vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32).to(device).eval()
-        for p in self.vae.parameters(): p.requires_grad = False
+def calculate_psnr(img1, img2, max_val=255.0):
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    mse = np.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return float('inf')
+    return 20 * np.log10(max_val / np.sqrt(mse))
+
+
+def calculate_ssim(img1, img2):
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
     
-    @torch.no_grad()
-    def encode(self, x):
-        return self.vae.encode(x).latent_dist.sample() * self.vae.config.scaling_factor
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
     
-    @torch.no_grad()
-    def decode(self, z):
-        return self.vae.decode(z / self.vae.config.scaling_factor).sample
+    if img1.ndim == 3:
+        ssim_vals = [calculate_ssim(img1[:,:,c], img2[:,:,c]) for c in range(img1.shape[2])]
+        return np.mean(ssim_vals)
+    
+    mu1, mu2 = np.mean(img1), np.mean(img2)
+    sigma1_sq, sigma2_sq = np.var(img1), np.var(img2)
+    sigma12 = np.mean((img1 - mu1) * (img2 - mu2))
+    
+    ssim = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
+           ((mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim
 
 
 # ============================================================================
-# MMDiT Components
+# Model (same as training)
 # ============================================================================
+
+class PatchEmbed(nn.Module):
+    def __init__(self, patch_size=4, in_channels=3, embed_dim=768):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+    def forward(self, x):
+        return self.proj(x).flatten(2).transpose(1, 2)
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(frequency_embedding_size, hidden_size), nn.SiLU(), nn.Linear(hidden_size, hidden_size))
+        self.frequency_embedding_size = frequency_embedding_size
+    def forward(self, t):
+        half = self.frequency_embedding_size // 2
+        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
+        args = t[:, None] * freqs[None]
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        return self.mlp(emb)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -57,123 +96,84 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None):
+        super().__init__()
+        hidden_features = hidden_features or in_features * 4
+        self.fc1, self.act, self.fc2 = nn.Linear(in_features, hidden_features), nn.GELU(), nn.Linear(hidden_features, in_features)
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
 
 class MMDiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.hidden_size, self.num_heads = hidden_size, num_heads
-        self.head_dim = hidden_size // num_heads
-        
-        self.norm1_img, self.norm2_img = RMSNorm(hidden_size), RMSNorm(hidden_size)
-        self.norm1_cond, self.norm2_cond = RMSNorm(hidden_size), RMSNorm(hidden_size)
-        
-        self.qkv_img = nn.Linear(hidden_size, hidden_size * 3)
-        self.qkv_cond = nn.Linear(hidden_size, hidden_size * 3)
-        self.proj_img = nn.Linear(hidden_size, hidden_size)
-        self.proj_cond = nn.Linear(hidden_size, hidden_size)
-        
-        mlp_h = int(hidden_size * mlp_ratio)
-        self.mlp_img = nn.Sequential(nn.Linear(hidden_size, mlp_h), nn.GELU(), nn.Linear(mlp_h, hidden_size))
-        self.mlp_cond = nn.Sequential(nn.Linear(hidden_size, mlp_h), nn.GELU(), nn.Linear(mlp_h, hidden_size))
-        
-        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size * 6))
+        self.hidden_size, self.num_heads, self.head_dim = hidden_size, num_heads, hidden_size // num_heads
+        self.norm1_img, self.norm1_cond = RMSNorm(hidden_size), RMSNorm(hidden_size)
+        self.norm2_img, self.norm2_cond = RMSNorm(hidden_size), RMSNorm(hidden_size)
+        self.qkv_img, self.qkv_cond = nn.Linear(hidden_size, hidden_size * 3), nn.Linear(hidden_size, hidden_size * 3)
+        self.proj_img, self.proj_cond = nn.Linear(hidden_size, hidden_size), nn.Linear(hidden_size, hidden_size)
+        mlp_hidden = int(hidden_size * mlp_ratio)
+        self.mlp_img, self.mlp_cond = Mlp(hidden_size, mlp_hidden), Mlp(hidden_size, mlp_hidden)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
     
     def forward(self, x_img, x_cond, c):
         B = x_img.shape[0]
-        shift_i, scale_i, gate_i, shift_c, scale_c, gate_c = self.adaLN(c).chunk(6, dim=-1)
-        
-        xi = self.norm1_img(x_img) * (1 + scale_i.unsqueeze(1)) + shift_i.unsqueeze(1)
-        xc = self.norm1_cond(x_cond) * (1 + scale_c.unsqueeze(1)) + shift_c.unsqueeze(1)
-        
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        xi = self.norm1_img(x_img) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        xc = self.norm1_cond(x_cond) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         qkv_i = self.qkv_img(xi).reshape(B, -1, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         qkv_c = self.qkv_cond(xc).reshape(B, -1, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q_i, k_i, v_i = qkv_i[0], qkv_i[1], qkv_i[2]
-        q_c, k_c, v_c = qkv_c[0], qkv_c[1], qkv_c[2]
-        
-        k_j, v_j = torch.cat([k_i, k_c], dim=2), torch.cat([v_i, v_c], dim=2)
-        attn_i = F.scaled_dot_product_attention(q_i, k_j, v_j).transpose(1,2).reshape(B, -1, self.hidden_size)
-        attn_c = F.scaled_dot_product_attention(q_c, k_j, v_j).transpose(1,2).reshape(B, -1, self.hidden_size)
-        
-        x_img = x_img + gate_i.unsqueeze(1) * self.proj_img(attn_i)
-        x_cond = x_cond + gate_c.unsqueeze(1) * self.proj_cond(attn_c)
-        x_img = x_img + gate_i.unsqueeze(1) * self.mlp_img(self.norm2_img(x_img))
-        x_cond = x_cond + gate_c.unsqueeze(1) * self.mlp_cond(self.norm2_cond(x_cond))
+        q_i, k_i, v_i = qkv_i.unbind(0)
+        q_c, k_c, v_c = qkv_c.unbind(0)
+        k_joint, v_joint = torch.cat([k_i, k_c], dim=2), torch.cat([v_i, v_c], dim=2)
+        attn_i = F.scaled_dot_product_attention(q_i, k_joint, v_joint).transpose(1, 2).reshape(B, -1, self.hidden_size)
+        attn_c = F.scaled_dot_product_attention(q_c, k_joint, v_joint).transpose(1, 2).reshape(B, -1, self.hidden_size)
+        x_img = x_img + gate_msa.unsqueeze(1) * self.proj_img(attn_i)
+        x_cond = x_cond + gate_msa.unsqueeze(1) * self.proj_cond(attn_c)
+        x_img = x_img + gate_mlp.unsqueeze(1) * self.mlp_img(self.norm2_img(x_img) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1))
+        x_cond = x_cond + gate_mlp.unsqueeze(1) * self.mlp_cond(self.norm2_cond(x_cond) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1))
         return x_img, x_cond
 
-
-class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, freq_dim=256):
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(freq_dim, hidden_size), nn.SiLU(), nn.Linear(hidden_size, hidden_size))
-        self.freq_dim = freq_dim
-    def forward(self, t):
-        half = self.freq_dim // 2
-        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
-        emb = torch.cat([torch.cos(t[:,None] * freqs), torch.sin(t[:,None] * freqs)], dim=-1)
-        return self.mlp(emb)
+        self.norm_final = RMSNorm(hidden_size)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        return self.linear(self.norm_final(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1))
 
-
-class MMDiT(nn.Module):
+class MeanFlowMMDiT(nn.Module):
     def __init__(self, img_size=128, patch_size=4, in_channels=3, hidden_size=512, depth=12, num_heads=8, mlp_ratio=4.0):
         super().__init__()
         self.patch_size, self.in_channels, self.hidden_size = patch_size, in_channels, hidden_size
         self.num_patches = (img_size // patch_size) ** 2
-        patch_dim = patch_size * patch_size * in_channels
-        
-        self.patch_embed_img = nn.Linear(patch_dim, hidden_size)
-        self.patch_embed_cond = nn.Linear(patch_dim, hidden_size)
+        self.patch_embed_img = PatchEmbed(patch_size, in_channels, hidden_size)
+        self.patch_embed_cond = PatchEmbed(patch_size, in_channels, hidden_size)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, hidden_size))
-        
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        self.h_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder, self.h_embedder = TimestepEmbedder(hidden_size), TimestepEmbedder(hidden_size)
         self.blocks = nn.ModuleList([MMDiTBlock(hidden_size, num_heads, mlp_ratio) for _ in range(depth)])
-        
-        self.norm_out = RMSNorm(hidden_size)
-        self.proj_out = nn.Linear(hidden_size, patch_dim)
+        self.final_layer = FinalLayer(hidden_size, patch_size, in_channels)
     
-    def patchify(self, x):
-        B, C, H, W = x.shape
+    def unpatchify(self, x):
         p = self.patch_size
-        return x.reshape(B, C, H//p, p, W//p, p).permute(0, 2, 4, 1, 3, 5).reshape(B, -1, C*p*p)
+        h = w = int(x.shape[1] ** 0.5)
+        return x.reshape(x.shape[0], h, w, p, p, self.in_channels).permute(0, 5, 1, 3, 2, 4).reshape(x.shape[0], self.in_channels, h*p, w*p)
     
-    def unpatchify(self, x, h, w):
-        B, N, _ = x.shape
-        p = self.patch_size
-        return x.reshape(B, h//p, w//p, self.in_channels, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, self.in_channels, h, w)
-    
-    def forward(self, z_t, z_cond, t, h):
-        B, C, H, W = z_t.shape
-        num_patches = (H // self.patch_size) * (W // self.patch_size)
-        pos = self._interp_pos(H, W) if num_patches != self.num_patches else self.pos_embed
-        
-        x_img = self.patch_embed_img(self.patchify(z_t)) + pos
-        x_cond = self.patch_embed_cond(self.patchify(z_cond)) + pos
+    def forward(self, z_t, lr_cond, t, h):
+        x_img = self.patch_embed_img(z_t) + self.pos_embed
+        x_cond = self.patch_embed_cond(lr_cond) + self.pos_embed
         c = self.t_embedder(t) + self.h_embedder(h)
-        
-        for blk in self.blocks:
-            x_img, x_cond = blk(x_img, x_cond, c)
-        return self.unpatchify(self.proj_out(self.norm_out(x_img)), H, W)
-    
-    def _interp_pos(self, h, w):
-        old = int(self.num_patches ** 0.5)
-        nh, nw = h // self.patch_size, w // self.patch_size
-        pos = self.pos_embed.reshape(1, old, old, -1).permute(0, 3, 1, 2)
-        pos = F.interpolate(pos, size=(nh, nw), mode='bilinear', align_corners=False)
-        return pos.permute(0, 2, 3, 1).reshape(1, nh * nw, -1)
+        for block in self.blocks:
+            x_img, x_cond = block(x_img, x_cond, c)
+        return self.unpatchify(self.final_layer(x_img, c))
 
-
-# ============================================================================
-# Model Configs
-# ============================================================================
-
-CONFIGS = {
-    'xs': (256, 8, 4), 'small': (384, 12, 6), 'base': (512, 12, 8), 'large': (768, 24, 12)
-}
-
-def create_model(model_size, mode, img_size):
-    h, d, n = CONFIGS[model_size]
-    ps, ch = (4, 3) if mode == 'pixel' else (2, 16)
-    return MMDiT(img_size=img_size, patch_size=ps, in_channels=ch, hidden_size=h, depth=d, num_heads=n)
+def MeanFlowMMDiT_XS(img_size=128): return MeanFlowMMDiT(img_size, hidden_size=256, depth=8, num_heads=4)
+def MeanFlowMMDiT_S(img_size=128): return MeanFlowMMDiT(img_size, hidden_size=384, depth=12, num_heads=6)
+def MeanFlowMMDiT_B(img_size=128): return MeanFlowMMDiT(img_size, hidden_size=512, depth=12, num_heads=8)
+def MeanFlowMMDiT_L(img_size=128): return MeanFlowMMDiT(img_size, hidden_size=768, depth=24, num_heads=12)
+MODEL_CONFIGS = {'xs': MeanFlowMMDiT_XS, 'small': MeanFlowMMDiT_S, 'base': MeanFlowMMDiT_B, 'large': MeanFlowMMDiT_L}
 
 
 # ============================================================================
@@ -181,81 +181,46 @@ def create_model(model_size, mode, img_size):
 # ============================================================================
 
 @torch.no_grad()
-def inference_tile(model, lr_img, device, tile_size, overlap, num_steps, mode, vae):
-    """Tiled inference for large images"""
+def inference_tile(model, lr_img, device, tile_size, overlap, num_steps):
     _, C, H, W = lr_img.shape
-    
-    # Small image: direct process
     if H <= tile_size and W <= tile_size:
-        return inference_single(model, lr_img, device, num_steps, mode, vae)
+        return inference_single(model, lr_img, device, num_steps)
     
-    # Tiled processing
     stride = tile_size - overlap
     output = torch.zeros(1, 3, H, W, device=device)
     weight = torch.zeros(1, 1, H, W, device=device)
-    blend = _create_blend_weight(tile_size, overlap, device)
+    
+    blend = torch.ones(1, 1, tile_size, tile_size, device=device)
+    if overlap > 0:
+        ramp = torch.linspace(0, 1, overlap, device=device)
+        blend[:, :, :overlap, :] *= ramp.view(1, 1, -1, 1)
+        blend[:, :, -overlap:, :] *= ramp.flip(0).view(1, 1, -1, 1)
+        blend[:, :, :, :overlap] *= ramp.view(1, 1, 1, -1)
+        blend[:, :, :, -overlap:] *= ramp.flip(0).view(1, 1, 1, -1)
     
     for y in range(0, H, stride):
         for x in range(0, W, stride):
             ye, xe = min(y + tile_size, H), min(x + tile_size, W)
             ys, xs = max(0, ye - tile_size), max(0, xe - tile_size)
-            
             tile = lr_img[:, :, ys:ye, xs:xe]
             th, tw = tile.shape[2], tile.shape[3]
-            
             if th < tile_size or tw < tile_size:
                 tile = F.pad(tile, (0, tile_size - tw, 0, tile_size - th), mode='reflect')
-            
-            out = inference_single(model, tile, device, num_steps, mode, vae)
-            out = out[:, :, :th, :tw]
-            
+            out = inference_single(model, tile, device, num_steps)[:, :, :th, :tw]
             w = blend[:, :, :th, :tw]
             output[:, :, ys:ye, xs:xe] += out * w
             weight[:, :, ys:ye, xs:xe] += w
     
     return output / (weight + 1e-8)
 
-
 @torch.no_grad()
-def inference_single(model, lr_img, device, num_steps, mode, vae):
-    """Single tile inference"""
-    lr_in = vae.encode(lr_img) if mode == 'latent' else lr_img
-    x, dt = lr_in.clone(), 1.0 / num_steps
-    
+def inference_single(model, lr_img, device, num_steps=1):
+    x, dt = lr_img.clone(), 1.0 / num_steps
     for i in range(num_steps):
         t = torch.full((1,), 1.0 - i * dt, device=device)
         h = torch.full((1,), dt, device=device)
-        x = x - dt * model(x, lr_in, t, h)
-    
-    return vae.decode(x) if mode == 'latent' else x
-
-
-def _create_blend_weight(size, overlap, device):
-    w = torch.ones(1, 1, size, size, device=device)
-    if overlap > 0:
-        ramp = torch.linspace(0, 1, overlap, device=device)
-        w[:, :, :overlap, :] *= ramp.view(1, 1, -1, 1)
-        w[:, :, -overlap:, :] *= ramp.flip(0).view(1, 1, -1, 1)
-        w[:, :, :, :overlap] *= ramp.view(1, 1, 1, -1)
-        w[:, :, :, -overlap:] *= ramp.flip(0).view(1, 1, 1, -1)
-    return w
-
-
-# ============================================================================
-# Metrics
-# ============================================================================
-
-def calc_psnr(img1, img2):
-    mse = np.mean((img1.astype(float) - img2.astype(float)) ** 2)
-    return 10 * np.log10(255**2 / (mse + 1e-8)) if mse > 0 else float('inf')
-
-
-def calc_ssim(img1, img2):
-    try:
-        from skimage.metrics import structural_similarity as ssim
-        return ssim(img1, img2, channel_axis=2, data_range=255)
-    except:
-        return 0.0
+        x = x - dt * model(x, lr_img, t, h)
+    return x
 
 
 # ============================================================================
@@ -263,103 +228,202 @@ def calc_ssim(img1, img2):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='MeanFlow-MMDiT Evaluation')
+    
+    # Required
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--hr_dir', type=str, required=True)
     parser.add_argument('--lr_dir', type=str, required=True)
+    
+    # Model
     parser.add_argument('--model_size', type=str, default='small', choices=['xs', 'small', 'base', 'large'])
     parser.add_argument('--scale', type=int, default=4)
-    parser.add_argument('--mode', type=str, default=None, choices=['pixel', 'latent'], help='Auto-detect if not set')
-    parser.add_argument('--vae_type', type=str, default='flux', choices=['sd3', 'flux'])
+    
+    # Inference
     parser.add_argument('--tile_size', type=int, default=128)
     parser.add_argument('--overlap', type=int, default=16)
     parser.add_argument('--num_steps', type=int, default=1)
-    parser.add_argument('--output_dir', type=str, default=None)
+    
+    # Output
+    parser.add_argument('--output_base', type=str, default='./meanflow/outputs')
+    parser.add_argument('--dataset', type=str, default=None)
+    parser.add_argument('--save_images', action='store_true', default=True)
+    parser.add_argument('--save_comparisons', action='store_true', default=True)
+    
     parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     
-    # Load checkpoint
-    print(f"Loading: {args.checkpoint}")
+    # Auto-detect dataset
+    if args.dataset is None:
+        hr_lower = args.hr_dir.lower()
+        if 'urban' in hr_lower: args.dataset = 'Urban100'
+        elif 'div2k' in hr_lower: args.dataset = 'DIV2K'
+        elif 'set5' in hr_lower: args.dataset = 'Set5'
+        elif 'set14' in hr_lower: args.dataset = 'Set14'
+        elif 'bsd100' in hr_lower or 'b100' in hr_lower: args.dataset = 'BSD100'
+        elif 'manga' in hr_lower: args.dataset = 'Manga109'
+        else: args.dataset = 'Unknown'
+    
+    # Build output dir
+    model_name = f'MMDiT_{args.model_size}'
+    exp_name = f"{model_name}_{args.num_steps}step_x{args.scale}"
+    output_dir = os.path.join(args.output_base, args.dataset, exp_name)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    if args.save_images:
+        os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
+    if args.save_comparisons:
+        os.makedirs(os.path.join(output_dir, 'comparisons'), exist_ok=True)
+    
+    print("="*70)
+    print("MeanFlow-MMDiT Evaluation")
+    print("="*70)
+    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Model: {model_name}")
+    print(f"Dataset: {args.dataset}")
+    print(f"Scale: {args.scale}x, Steps: {args.num_steps}")
+    print(f"Tile: {args.tile_size}, Overlap: {args.overlap}")
+    print(f"Output: {output_dir}")
+    print("="*70)
+    
+    # Load model
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    
-    # Auto-detect mode
-    mode = args.mode or ckpt.get('mode', 'pixel')
-    print(f"Mode: {mode}")
-    
-    # Load VAE if latent mode
-    vae = VAEWrapper(args.vae_type, device) if mode == 'latent' else None
-    
-    # Determine img_size from checkpoint
-    pos_shape = ckpt.get('ema', ckpt['model'])['pos_embed'].shape
-    num_patches = pos_shape[1]
-    grid_size = int(num_patches ** 0.5)
-    
-    # Detect patch_size from model weights
-    patch_embed_shape = ckpt.get('ema', ckpt['model'])['patch_embed_img.weight'].shape
-    patch_dim = patch_embed_shape[1]
-    in_channels = 3 if mode == 'pixel' else 16
-    patch_size = int((patch_dim / in_channels) ** 0.5)
-    
-    img_size = grid_size * patch_size
-    print(f"Detected: img_size={img_size}, patch_size={patch_size}, in_channels={in_channels}")
-    
-    # Create model
-    model = create_model(args.model_size, mode, img_size)
-    
-    # Load weights (use EMA if available)
-    weights = ckpt.get('ema', ckpt['model'])
-    model.load_state_dict(weights)
+    model = MODEL_CONFIGS[args.model_size](img_size=args.tile_size)
+    model.load_state_dict(ckpt.get('ema', ckpt['model']))
     model = model.to(device).eval()
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    if 'epoch' in ckpt:
+        print(f"Trained for {ckpt['epoch']+1} epochs")
     
     # Get files
     hr_files = sorted([f for f in os.listdir(args.hr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     lr_files = sorted([f for f in os.listdir(args.lr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    assert len(hr_files) == len(lr_files)
     
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
+    print(f"\nEvaluating {len(hr_files)} images...\n")
     
-    print(f"\nEvaluating {len(hr_files)} images...")
-    print(f"Tile: {args.tile_size}, Overlap: {args.overlap}, Steps: {args.num_steps}")
-    print("="*60)
-    
-    psnrs, ssims, bicubic_psnrs = [], [], []
+    psnr_list, ssim_list = [], []
+    psnr_bic_list, ssim_bic_list = [], []
+    results_per_image = []
     
     for hf, lf in tqdm(zip(hr_files, lr_files), total=len(hr_files)):
+        base_name = os.path.splitext(hf)[0]
+        
         hr_img = Image.open(os.path.join(args.hr_dir, hf)).convert('RGB')
         lr_img = Image.open(os.path.join(args.lr_dir, lf)).convert('RGB')
-        lr_up = lr_img.resize(hr_img.size, Image.BICUBIC)
         
-        # To tensor
-        lr_t = torch.from_numpy(np.array(lr_up)).float().permute(2,0,1).unsqueeze(0) / 127.5 - 1.0
+        hr_np = np.array(hr_img)
+        H, W = hr_np.shape[0], hr_np.shape[1]
+        
+        # Bicubic baseline
+        lr_bicubic = lr_img.resize((W, H), Image.BICUBIC)
+        lr_bicubic_np = np.array(lr_bicubic)
+        
+        # Prepare input
+        lr_up = lr_img.resize((W, H), Image.BICUBIC)
+        lr_t = torch.from_numpy(np.array(lr_up)).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
         lr_t = lr_t.to(device)
         
         # Inference
-        pred = inference_tile(model, lr_t, device, args.tile_size, args.overlap, args.num_steps, mode, vae)
-        
-        # To numpy
-        pred_np = ((pred[0].cpu().clamp(-1,1) + 1) * 127.5).permute(1,2,0).numpy().astype(np.uint8)
-        hr_np = np.array(hr_img)
-        lr_up_np = np.array(lr_up)
+        pred = inference_tile(model, lr_t, device, args.tile_size, args.overlap, args.num_steps)
+        pred_np = ((pred[0].cpu().clamp(-1, 1) + 1) * 127.5).permute(1, 2, 0).numpy().astype(np.uint8)
         
         # Metrics
-        psnrs.append(calc_psnr(pred_np, hr_np))
-        ssims.append(calc_ssim(pred_np, hr_np))
-        bicubic_psnrs.append(calc_psnr(lr_up_np, hr_np))
+        psnr_val = calculate_psnr(pred_np, hr_np)
+        ssim_val = calculate_ssim(pred_np, hr_np)
+        psnr_bic = calculate_psnr(lr_bicubic_np, hr_np)
+        ssim_bic = calculate_ssim(lr_bicubic_np, hr_np)
         
-        if args.output_dir:
-            Image.fromarray(pred_np).save(os.path.join(args.output_dir, hf))
+        psnr_list.append(psnr_val)
+        ssim_list.append(ssim_val)
+        psnr_bic_list.append(psnr_bic)
+        ssim_bic_list.append(ssim_bic)
+        
+        results_per_image.append({
+            'name': hf,
+            'psnr': psnr_val,
+            'ssim': ssim_val,
+            'psnr_bicubic': psnr_bic,
+            'ssim_bicubic': ssim_bic,
+            'psnr_gain': psnr_val - psnr_bic,
+        })
+        
+        # Save prediction
+        if args.save_images:
+            Image.fromarray(pred_np).save(os.path.join(output_dir, 'predictions', f'{base_name}.png'))
+        
+        # Save comparison: LR | Bicubic | SR | GT
+        if args.save_comparisons:
+            lr_display = lr_img.resize((W, H), Image.NEAREST)
+            comparison = np.concatenate([np.array(lr_display), lr_bicubic_np, pred_np, hr_np], axis=1)
+            Image.fromarray(comparison).save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
     
-    print("="*60)
-    print(f"Results ({len(hr_files)} images):")
-    print(f"  PSNR:    {np.mean(psnrs):.4f} dB (±{np.std(psnrs):.4f})")
-    print(f"  SSIM:    {np.mean(ssims):.4f} (±{np.std(ssims):.4f})")
-    print(f"  Bicubic: {np.mean(bicubic_psnrs):.4f} dB")
-    print(f"  Gain:    +{np.mean(psnrs) - np.mean(bicubic_psnrs):.4f} dB")
-    print("="*60)
+    # Average metrics
+    avg_psnr = np.mean(psnr_list)
+    avg_ssim = np.mean(ssim_list)
+    avg_psnr_bic = np.mean(psnr_bic_list)
+    avg_ssim_bic = np.mean(ssim_bic_list)
+    
+    # Print results
+    print("\n" + "="*70)
+    print("                        Evaluation Results")
+    print("="*70)
+    print(f"Dataset: {args.dataset}")
+    print(f"Model: {model_name}")
+    print(f"Test images: {len(psnr_list)}")
+    print(f"Scale: {args.scale}x, Steps: {args.num_steps}")
+    print("-"*70)
+    print(f"{'Method':<20} {'PSNR (dB)':<15} {'SSIM':<15}")
+    print("-"*70)
+    print(f"{'Bicubic':<20} {avg_psnr_bic:<15.4f} {avg_ssim_bic:<15.4f}")
+    print(f"{model_name:<20} {avg_psnr:<15.4f} {avg_ssim:<15.4f}")
+    print("-"*70)
+    print(f"{'Improvement':<20} {avg_psnr - avg_psnr_bic:+.4f} dB        {avg_ssim - avg_ssim_bic:+.4f}")
+    print("="*70)
+    
+    # Save results to file
+    results_file = os.path.join(output_dir, 'results.txt')
+    with open(results_file, 'w', encoding='utf-8') as f:
+        f.write("="*70 + "\n")
+        f.write("MeanFlow-MMDiT Evaluation Results\n")
+        f.write("="*70 + "\n")
+        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Dataset: {args.dataset}\n")
+        f.write(f"Model: {model_name}\n")
+        f.write(f"Checkpoint: {args.checkpoint}\n")
+        f.write(f"HR directory: {args.hr_dir}\n")
+        f.write(f"LR directory: {args.lr_dir}\n")
+        f.write(f"Scale: {args.scale}x\n")
+        f.write(f"Sampling steps: {args.num_steps}\n")
+        f.write(f"Tile size: {args.tile_size}, Overlap: {args.overlap}\n")
+        f.write(f"Test images: {len(psnr_list)}\n")
+        f.write("\n")
+        
+        f.write("-"*70 + "\n")
+        f.write("Average Metrics:\n")
+        f.write("-"*70 + "\n")
+        f.write(f"  Bicubic:      PSNR = {avg_psnr_bic:.4f} dB,  SSIM = {avg_ssim_bic:.4f}\n")
+        f.write(f"  {model_name}:  PSNR = {avg_psnr:.4f} dB,  SSIM = {avg_ssim:.4f}\n")
+        f.write(f"  Improvement:  PSNR = {avg_psnr - avg_psnr_bic:+.4f} dB,  SSIM = {avg_ssim - avg_ssim_bic:+.4f}\n")
+        f.write("\n")
+        
+        f.write("-"*70 + "\n")
+        f.write("Per-image Results (sorted by PSNR gain):\n")
+        f.write("-"*70 + "\n")
+        f.write(f"{'Image':<35} {'PSNR':<10} {'SSIM':<10} {'Bicubic':<10} {'Gain':<10}\n")
+        f.write("-"*70 + "\n")
+        
+        for r in sorted(results_per_image, key=lambda x: x['psnr_gain'], reverse=True):
+            f.write(f"{r['name']:<35} {r['psnr']:<10.4f} {r['ssim']:<10.4f} "
+                    f"{r['psnr_bicubic']:<10.4f} {r['psnr_gain']:+.4f}\n")
+    
+    print(f"\nResults saved to: {output_dir}")
+    print(f"  - results.txt: Detailed metrics")
+    if args.save_images:
+        print(f"  - predictions/: SR output images")
+    if args.save_comparisons:
+        print(f"  - comparisons/: LR | Bicubic | SR | GT")
 
 
 if __name__ == '__main__':
