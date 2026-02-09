@@ -2,7 +2,7 @@
 MeanFlow-MMDiT Evaluation
 
 Output structure:
-    outputs/
+    meanflow/outputs/
     └── DIV2K/
         └── MMDiT_small_1step_x4/
             ├── predictions/
@@ -180,47 +180,130 @@ MODEL_CONFIGS = {'xs': MeanFlowMMDiT_XS, 'small': MeanFlowMMDiT_S, 'base': MeanF
 # Inference
 # ============================================================================
 
-@torch.no_grad()
-def inference_tile(model, lr_img, device, tile_size, overlap, num_steps):
-    _, C, H, W = lr_img.shape
-    if H <= tile_size and W <= tile_size:
-        return inference_single(model, lr_img, device, num_steps)
-    
-    stride = tile_size - overlap
-    output = torch.zeros(1, 3, H, W, device=device)
-    weight = torch.zeros(1, 1, H, W, device=device)
-    
-    blend = torch.ones(1, 1, tile_size, tile_size, device=device)
-    if overlap > 0:
-        ramp = torch.linspace(0, 1, overlap, device=device)
-        blend[:, :, :overlap, :] *= ramp.view(1, 1, -1, 1)
-        blend[:, :, -overlap:, :] *= ramp.flip(0).view(1, 1, -1, 1)
-        blend[:, :, :, :overlap] *= ramp.view(1, 1, 1, -1)
-        blend[:, :, :, -overlap:] *= ramp.flip(0).view(1, 1, 1, -1)
-    
-    for y in range(0, H, stride):
-        for x in range(0, W, stride):
-            ye, xe = min(y + tile_size, H), min(x + tile_size, W)
-            ys, xs = max(0, ye - tile_size), max(0, xe - tile_size)
-            tile = lr_img[:, :, ys:ye, xs:xe]
-            th, tw = tile.shape[2], tile.shape[3]
-            if th < tile_size or tw < tile_size:
-                tile = F.pad(tile, (0, tile_size - tw, 0, tile_size - th), mode='reflect')
-            out = inference_single(model, tile, device, num_steps)[:, :, :th, :tw]
-            w = blend[:, :, :th, :tw]
-            output[:, :, ys:ye, xs:xe] += out * w
-            weight[:, :, ys:ye, xs:xe] += w
-    
-    return output / (weight + 1e-8)
+def pad_to_multiple(x, multiple=4):
+    """Pad tensor to be divisible by multiple"""
+    h, w = x.shape[2], x.shape[3]
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return x, (0, 0)
+    return F.pad(x, (0, pad_w, 0, pad_h), mode='reflect'), (pad_h, pad_w)
+
 
 @torch.no_grad()
-def inference_single(model, lr_img, device, num_steps=1):
-    x, dt = lr_img.clone(), 1.0 / num_steps
+def run_sr_single(model, lr_tensor, device, num_steps=1):
+    """Run SR on single image (with padding)"""
+    lr_padded, (pad_h, pad_w) = pad_to_multiple(lr_tensor, multiple=4)
+    
+    x = lr_padded.clone()
+    dt = 1.0 / num_steps
+    
     for i in range(num_steps):
         t = torch.full((1,), 1.0 - i * dt, device=device)
         h = torch.full((1,), dt, device=device)
-        x = x - dt * model(x, lr_img, t, h)
+        x = x - dt * model(x, lr_padded, t, h)
+    
+    # Remove padding
+    if pad_h > 0 or pad_w > 0:
+        x = x[:, :, :x.shape[2]-pad_h if pad_h > 0 else x.shape[2],
+                   :x.shape[3]-pad_w if pad_w > 0 else x.shape[3]]
+    
     return x
+
+
+@torch.no_grad()
+def run_sr_tiled(model, lr_tensor, device, num_steps=1, tile_size=128, overlap=16):
+    """
+    Run SR with tiling for large images
+    
+    Key fix: Only reduce blend weight at edges that overlap with OTHER tiles,
+    not at image boundaries.
+    """
+    _, _, H, W = lr_tensor.shape
+    
+    # If small enough, process directly
+    if H <= tile_size and W <= tile_size:
+        return run_sr_single(model, lr_tensor, device, num_steps)
+    
+    output = torch.zeros_like(lr_tensor)
+    weight = torch.zeros_like(lr_tensor)
+    
+    stride = tile_size - overlap
+    
+    # Calculate tile positions - ensure full coverage
+    h_starts = list(range(0, max(1, H - tile_size + 1), stride))
+    if not h_starts:
+        h_starts = [0]
+    if h_starts[-1] + tile_size < H:
+        h_starts.append(max(0, H - tile_size))
+    
+    w_starts = list(range(0, max(1, W - tile_size + 1), stride))
+    if not w_starts:
+        w_starts = [0]
+    if w_starts[-1] + tile_size < W:
+        w_starts.append(max(0, W - tile_size))
+    
+    for h_start in h_starts:
+        for w_start in w_starts:
+            h_end = min(h_start + tile_size, H)
+            w_end = min(w_start + tile_size, W)
+            
+            # Extract tile
+            tile = lr_tensor[:, :, h_start:h_end, w_start:w_end]
+            th, tw = tile.shape[2], tile.shape[3]
+            
+            # Pad tile if needed
+            if th < tile_size or tw < tile_size:
+                tile = F.pad(tile, (0, tile_size - tw, 0, tile_size - th), mode='reflect')
+            
+            # Process tile
+            tile_padded, (tile_pad_h, tile_pad_w) = pad_to_multiple(tile, multiple=4)
+            
+            x = tile_padded.clone()
+            dt = 1.0 / num_steps
+            
+            for i in range(num_steps):
+                t = torch.full((1,), 1.0 - i * dt, device=device)
+                h_param = torch.full((1,), dt, device=device)
+                x = x - dt * model(x, tile_padded, t, h_param)
+            
+            # Remove model padding
+            if tile_pad_h > 0 or tile_pad_w > 0:
+                x = x[:, :, :x.shape[2]-tile_pad_h if tile_pad_h > 0 else x.shape[2],
+                           :x.shape[3]-tile_pad_w if tile_pad_w > 0 else x.shape[3]]
+            
+            # Get actual tile output (remove size padding)
+            tile_output = x[:, :, :th, :tw]
+            
+            # Create tile-specific blending weight
+            # Only reduce weight at edges that overlap with OTHER tiles, not image boundaries
+            tile_weight = torch.ones(1, 1, th, tw, device=device)
+            
+            if overlap > 0:
+                # Top edge: reduce weight only if NOT at image top boundary
+                if h_start > 0:
+                    for i in range(min(overlap, th)):
+                        tile_weight[:, :, i, :] *= i / overlap
+                
+                # Bottom edge: reduce weight only if NOT at image bottom boundary
+                if h_end < H:
+                    for i in range(min(overlap, th)):
+                        tile_weight[:, :, th - 1 - i, :] *= i / overlap
+                
+                # Left edge: reduce weight only if NOT at image left boundary
+                if w_start > 0:
+                    for i in range(min(overlap, tw)):
+                        tile_weight[:, :, :, i] *= i / overlap
+                
+                # Right edge: reduce weight only if NOT at image right boundary
+                if w_end < W:
+                    for i in range(min(overlap, tw)):
+                        tile_weight[:, :, :, tw - 1 - i] *= i / overlap
+            
+            output[:, :, h_start:h_end, w_start:w_end] += tile_output * tile_weight
+            weight[:, :, h_start:h_end, w_start:w_end] += tile_weight
+    
+    return output / (weight + 1e-8)
 
 
 # ============================================================================
@@ -326,7 +409,7 @@ def main():
         lr_t = lr_t.to(device)
         
         # Inference
-        pred = inference_tile(model, lr_t, device, args.tile_size, args.overlap, args.num_steps)
+        pred = run_sr_tiled(model, lr_t, device, args.num_steps, args.tile_size, args.overlap)
         pred_np = ((pred[0].cpu().clamp(-1, 1) + 1) * 127.5).permute(1, 2, 0).numpy().astype(np.uint8)
         
         # Metrics
