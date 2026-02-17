@@ -137,13 +137,13 @@ class MMDiTBlock(nn.Module):
         
         self.mlp_img = Mlp(hidden_size, int(hidden_size * mlp_ratio))
         self.mlp_cond = Mlp(hidden_size, int(hidden_size * mlp_ratio))
-        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
     
     def forward(self, x_img, x_cond, c):
         B, N, C = x_img.shape
         H = W = int(math.sqrt(N))
         
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN(c).chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         xi = self.norm1_img(x_img) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         xc = self.norm1_cond(x_cond) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         
@@ -173,12 +173,12 @@ class MMDiTBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm = RMSNorm(hidden_size)
+        self.norm_final = RMSNorm(hidden_size)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
-        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
     def forward(self, x, c):
-        shift, scale = self.adaLN(c).chunk(2, dim=1)
-        return self.linear(self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1))
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        return self.linear(self.norm_final(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1))
 
 
 class MeanFlowMMDiT(nn.Module):
