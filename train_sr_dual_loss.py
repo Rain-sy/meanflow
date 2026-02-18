@@ -1,43 +1,32 @@
 """
-Dual-Pipeline Super-Resolution with Delta Learning
+MeanFlow SR with FLUX Feature Loss (V1 Base + FLUX as Judge)
 
-Architecture:
-    Main Pipeline (DiT): Structure preservation [TRAINABLE]
-    Detail Pipeline (FLUX): Texture delta extraction [FROZEN]
-    
-    SR = F_main + α ⊙ Δ
-    where Δ = I_flux - LR_bicubic (high-frequency detail)
-          α = learned gating weight
+Architecture: Simple DiT (V1, 3ch input) - proven to work (28.51 dB)
+Loss: MSE + FLUX Feature Loss (FLUX as judge, not generator)
 
-MeanFlow Training Strategy:
-    60%: h=0, t~logit-normal (instantaneous velocity)
-    20%: h>0 (average velocity)
-    20%: t=1, h=1 (one-step inference)
+The idea:
+    - Model structure stays simple (V1)
+    - FLUX VAE encoder extracts features from both x_pred and HR
+    - Loss encourages x_pred to have similar FLUX features as HR
+    - This teaches the model to produce FLUX-like textures
+
+Loss = MSE(velocity, target) + λ * ||FLUX_Encode(x_pred) - FLUX_Encode(HR)||²
 
 Usage:
-    # Without FLUX (for testing)
-    python train_sr_dual.py \
+    # Without FLUX loss (baseline)
+    python train_sr_dual_loss.py \
+        --hr_dir Data/DIV2K/DIV2K_train_HR \
+        --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
+        --model_size small  
+
+    # With FLUX loss
+    python train_sr_dual_loss.py \
         --hr_dir Data/DIV2K/DIV2K_train_HR \
         --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --model_size small --scale 4
-
-    # 加入 LPIPS (推荐)
-    python train_sr_dual.py \
-        --hr_dir Data/DIV2K/DIV2K_train_HR \
-        --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
-        --use_lpips --lpips_weight 0.1 \
-        --model_size small --scale 4
-
-    # 完整版 (FLUX + LPIPS)
-    python train_sr_dual.py \
-        --hr_dir Data/DIV2K/DIV2K_train_HR \
-        --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --use_flux --use_lpips \
-        --model_size small --scale 4 --device cuda:1
+        --model_size small \
+        --use_flux_loss --flux_loss_weight 0.1   --device cuda:7
 """
 
 import os
@@ -58,14 +47,6 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# Optional: LPIPS for perceptual loss
-try:
-    import lpips
-    LPIPS_AVAILABLE = True
-except ImportError:
-    LPIPS_AVAILABLE = False
-    print("Warning: lpips not installed. Run 'pip install lpips' for perceptual loss.")
-
 
 # ============================================================================
 # Dataset
@@ -78,9 +59,7 @@ class SRDataset(Dataset):
         self.hr_files = sorted([f for f in os.listdir(hr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
         self.lr_files = sorted([f for f in os.listdir(lr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
         assert len(self.hr_files) == len(self.lr_files), \
-            f"HR/LR mismatch: {len(self.hr_files)} HR files vs {len(self.lr_files)} LR files\n" \
-            f"HR dir: {hr_dir}\nLR dir: {lr_dir}"
-        assert len(self.hr_files) > 0, f"No images found in {hr_dir}"
+            f"HR/LR mismatch: {len(self.hr_files)} HR vs {len(self.lr_files)} LR"
         print(f"[Dataset] {len(self.hr_files)} pairs, repeat={repeat}")
     
     def __len__(self):
@@ -121,7 +100,7 @@ class SRDataset(Dataset):
 
 
 # ============================================================================
-# Basic Components
+# Model Components
 # ============================================================================
 
 class RMSNorm(nn.Module):
@@ -174,14 +153,10 @@ class TimestepEmbedder(nn.Module):
 
 
 # ============================================================================
-# DiT Block (Single Stream, NOT MMDiT)
+# DiT Block
 # ============================================================================
 
 class DiTBlock(nn.Module):
-    """
-    Single-stream DiT block with Self-Attention + AdaLN
-    Simpler than MMDiT, fewer parameters
-    """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
         super().__init__()
         self.hidden_size = hidden_size
@@ -196,7 +171,6 @@ class DiTBlock(nn.Module):
         
         self.mlp = Mlp(hidden_size, int(hidden_size * mlp_ratio))
         
-        # AdaLN modulation
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size)
@@ -207,11 +181,9 @@ class DiTBlock(nn.Module):
     def forward(self, x, c):
         B, N, C = x.shape
         
-        # AdaLN modulation
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             self.adaLN_modulation(c).chunk(6, dim=1)
         
-        # Self-Attention
         x_norm = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -220,7 +192,6 @@ class DiTBlock(nn.Module):
         
         x = x + gate_msa.unsqueeze(1) * attn
         
-        # MLP
         x_norm2 = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm2)
         
@@ -248,13 +219,14 @@ class FinalLayer(nn.Module):
 
 
 # ============================================================================
-# Main Pipeline (DiT-based) with Input Conditioning
+# Main Model (V1 - Simple, 3ch input)
 # ============================================================================
 
-class MainPipeline(nn.Module):
+class MeanFlowDiT(nn.Module):
     """
-    Main pipeline: DiT blocks for structure preservation
-    Input: concat(z_t, lr_cond) = 6 channels for better conditioning
+    Simple DiT model for SR (V1 architecture)
+    Input: 3 channels (z_t only)
+    Proven to work: 28.51 dB on DIV2K
     """
     def __init__(
         self,
@@ -271,22 +243,19 @@ class MainPipeline(nn.Module):
         self.hidden_size = hidden_size
         self.num_patches = (img_size // patch_size) ** 2
         
-        # Patch embedding: 6 channels input (z_t + lr_cond)
-        self.patch_embed = PatchEmbed(patch_size, in_channels * 2, hidden_size)  # 6 channels
+        # V1: 3 channel input only
+        self.patch_embed = PatchEmbed(patch_size, in_channels, hidden_size)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, hidden_size))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         
-        # Time embedding
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.h_embedder = TimestepEmbedder(hidden_size)
         
-        # DiT blocks (single stream)
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads)
             for _ in range(depth)
         ])
         
-        # Final layer: output 3 channels
         self.final_layer = FinalLayer(hidden_size, patch_size, in_channels)
     
     def unpatchify(self, x):
@@ -296,300 +265,157 @@ class MainPipeline(nn.Module):
         return torch.einsum('nhwpqc->nchpwq', x).reshape(x.shape[0], self.in_channels, h * p, w * p)
     
     def forward(self, z_t, lr_cond, t, h):
-        # Concat z_t and lr_cond for better conditioning
-        x_input = torch.cat([z_t, lr_cond], dim=1)  # [B, 6, H, W]
-        
-        # Patch embed
-        x = self.patch_embed(x_input) + self.pos_embed
-        
-        # Time conditioning
+        # V1: only use z_t, ignore lr_cond in forward
+        # (lr_cond is kept in signature for compatibility)
+        x = self.patch_embed(z_t) + self.pos_embed
         c = self.t_embedder(t) + self.h_embedder(h)
         
-        # DiT blocks
         for block in self.blocks:
             x = block(x, c)
         
-        # Final layer + unpatchify
         x = self.final_layer(x, c)
         return self.unpatchify(x)
-
-
-# ============================================================================
-# Detail Pipeline (FLUX-based, Frozen)
-# ============================================================================
-
-class DetailPipeline(nn.Module):
-    """
-    Detail pipeline: FLUX VAE + DiT for texture details
-    All components are frozen, only used for inference
-    """
-    def __init__(self, use_flux=True):
-        super().__init__()
-        self.use_flux = use_flux
-        self.flux_loaded = False
-        self.vae = None
-        self.transformer = None
-    
-    def load_flux(self, device='cuda'):
-        """Load FLUX model (lazy loading)"""
-        if self.flux_loaded or not self.use_flux:
-            return
-        
-        try:
-            from diffusers import FluxPipeline
-            
-            print("Loading FLUX model...")
-            pipe = FluxPipeline.from_pretrained(
-                "black-forest-labs/FLUX.1-dev",
-                torch_dtype=torch.float16
-            )
-            
-            self.vae = pipe.vae.to(device)
-            self.vae.requires_grad_(False)
-            self.vae.eval()
-            
-            # Note: For full FLUX, we'd also load transformer
-            # For now, we just use VAE encode/decode
-            
-            self.flux_loaded = True
-            print("FLUX VAE loaded and frozen")
-            
-            # Clean up
-            del pipe
-            torch.cuda.empty_cache()
-            
-        except Exception as e:
-            print(f"Warning: Could not load FLUX: {e}")
-            print("Detail pipeline will return zeros (no texture enhancement)")
-            self.use_flux = False
-    
-    @torch.no_grad()
-    def forward(self, lr_bicubic):
-        """
-        Extract texture details from FLUX reconstruction
-        
-        Args:
-            lr_bicubic: [B, 3, H, W] in range [-1, 1]
-        
-        Returns:
-            I_flux: [B, 3, H, W] FLUX reconstruction
-        """
-        if not self.use_flux or self.vae is None:
-            # Return input as-is (no detail enhancement)
-            return lr_bicubic.clone()
-        
-        B, C, H, W = lr_bicubic.shape
-        
-        # Ensure dimensions are divisible by 8 for VAE
-        pad_h = (8 - H % 8) % 8
-        pad_w = (8 - W % 8) % 8
-        if pad_h > 0 or pad_w > 0:
-            lr_padded = F.pad(lr_bicubic, (0, pad_w, 0, pad_h), mode='reflect')
-        else:
-            lr_padded = lr_bicubic
-        
-        # VAE encode -> decode (adds FLUX texture characteristics)
-        lr_half = lr_padded.half()
-        latent = self.vae.encode(lr_half).latent_dist.sample()
-        latent = latent * self.vae.config.scaling_factor
-        I_flux = self.vae.decode(latent / self.vae.config.scaling_factor).sample
-        
-        # Remove padding
-        if pad_h > 0 or pad_w > 0:
-            I_flux = I_flux[:, :, :H, :W]
-        
-        return I_flux.float()
-
-
-# ============================================================================
-# Detail Refiner (Improved Delta Learning)
-# ============================================================================
-
-class ResBlock(nn.Module):
-    """Simple residual block for detail refinement"""
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.norm1 = nn.GroupNorm(8, channels)
-        self.norm2 = nn.GroupNorm(8, channels)
-        self.act = nn.GELU()
-    
-    def forward(self, x):
-        residual = x
-        x = self.act(self.norm1(self.conv1(x)))
-        x = self.norm2(self.conv2(x))
-        return x + residual
-
-
-class DetailRefiner(nn.Module):
-    """
-    Refine and gate high-frequency details from FLUX
-    
-    Instead of simple gating, this network can:
-    1. Fix VAE artifacts
-    2. Learn which details to keep
-    3. Adapt FLUX textures to match the target
-    
-    Input: concat(I_flux, lr_bicubic) = 6 channels
-    Output: refined detail to add to F_main
-    """
-    def __init__(self, in_channels=3, hidden_channels=64, num_resblocks=4):
-        super().__init__()
-        
-        # Input: concat(I_flux, lr_bicubic)
-        self.input_conv = nn.Conv2d(in_channels * 2, hidden_channels, 3, padding=1)
-        
-        # Residual blocks for refinement
-        self.resblocks = nn.Sequential(*[
-            ResBlock(hidden_channels) for _ in range(num_resblocks)
-        ])
-        
-        # Output projection
-        self.output_conv = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, in_channels, 3, padding=1),
-        )
-        
-        # Learnable global scale (initialized small)
-        self.detail_scale = nn.Parameter(torch.ones(1) * 0.1)
-        
-        # Zero-init output for stable training
-        nn.init.zeros_(self.output_conv[-1].weight)
-        nn.init.zeros_(self.output_conv[-1].bias)
-    
-    def forward(self, I_flux, lr_bicubic):
-        """
-        Args:
-            I_flux: [B, 3, H, W] FLUX reconstruction
-            lr_bicubic: [B, 3, H, W] bicubic upsampled LR
-        
-        Returns:
-            detail: [B, 3, H, W] refined detail to add
-        """
-        # Concat inputs
-        x = torch.cat([I_flux, lr_bicubic], dim=1)  # [B, 6, H, W]
-        
-        # Extract and refine features
-        x = self.input_conv(x)
-        x = self.resblocks(x)
-        
-        # Output refined detail
-        detail = self.output_conv(x)
-        
-        # Scale (learned, starts small)
-        detail = self.detail_scale * detail
-        
-        return detail
-
-
-# ============================================================================
-# Full Dual-Pipeline Model
-# ============================================================================
-
-class DualPipelineSR(nn.Module):
-    """
-    Dual-Pipeline Super-Resolution with Delta Learning
-    
-    SR = F_main + Detail
-    where:
-        F_main = MainPipeline(concat(z_t, lr_cond), t, h)  -- structure
-        Detail = DetailRefiner(I_flux, lr_cond)           -- refined texture from FLUX
-    """
-    def __init__(
-        self,
-        img_size=128,
-        patch_size=4,
-        hidden_size=384,
-        depth=12,
-        num_heads=6,
-        use_flux=True,
-        num_refiner_blocks=4,
-    ):
-        super().__init__()
-        self.img_size = img_size
-        self.use_flux = use_flux
-        
-        # Main pipeline (trainable) - now takes 6 channel input
-        self.main_pipeline = MainPipeline(
-            img_size=img_size,
-            patch_size=patch_size,
-            hidden_size=hidden_size,
-            depth=depth,
-            num_heads=num_heads,
-        )
-        
-        # Detail pipeline (frozen)
-        self.detail_pipeline = DetailPipeline(use_flux=use_flux)
-        
-        # Detail refiner (trainable) - replaces simple DetailExtractor
-        self.detail_refiner = DetailRefiner(
-            in_channels=3,
-            hidden_channels=64,
-            num_resblocks=num_refiner_blocks,
-        )
-    
-    def load_flux(self, device='cuda'):
-        """Load FLUX model"""
-        self.detail_pipeline.load_flux(device)
-    
-    def forward(self, z_t, lr_cond, t, h):
-        """
-        Args:
-            z_t: [B, 3, H, W] interpolated state (training) or LR (inference)
-            lr_cond: [B, 3, H, W] LR bicubic upsampled
-            t: [B] timestep
-            h: [B] step size
-        
-        Returns:
-            velocity: [B, 3, H, W] predicted velocity
-        """
-        # Main pipeline: structure + base reconstruction
-        # Now with input conditioning (concat z_t and lr_cond)
-        F_main = self.main_pipeline(z_t, lr_cond, t, h)  # [B, 3, H, W]
-        
-        # Detail pipeline: FLUX texture
-        if self.use_flux and self.detail_pipeline.flux_loaded:
-            with torch.no_grad():
-                I_flux = self.detail_pipeline(lr_cond)
-            # Refined detail (not just gated delta)
-            detail = self.detail_refiner(I_flux, lr_cond)
-        else:
-            detail = torch.zeros_like(F_main)
-        
-        # Combine: velocity = main + detail
-        velocity = F_main + detail
-        
-        return velocity
 
 
 # ============================================================================
 # Model Configurations
 # ============================================================================
 
-def DualPipeline_XS(img_size=128, use_flux=True):
-    return DualPipelineSR(img_size, hidden_size=256, depth=8, num_heads=4, use_flux=use_flux, num_refiner_blocks=2)
+def DiT_XS(img_size=128):
+    return MeanFlowDiT(img_size, hidden_size=256, depth=8, num_heads=4)
 
-def DualPipeline_S(img_size=128, use_flux=True):
-    return DualPipelineSR(img_size, hidden_size=384, depth=12, num_heads=6, use_flux=use_flux, num_refiner_blocks=4)
+def DiT_S(img_size=128):
+    return MeanFlowDiT(img_size, hidden_size=384, depth=12, num_heads=6)
 
-def DualPipeline_B(img_size=128, use_flux=True):
-    return DualPipelineSR(img_size, hidden_size=512, depth=12, num_heads=8, use_flux=use_flux, num_refiner_blocks=4)
+def DiT_B(img_size=128):
+    return MeanFlowDiT(img_size, hidden_size=512, depth=12, num_heads=8)
 
-def DualPipeline_L(img_size=128, use_flux=True):
-    return DualPipelineSR(img_size, hidden_size=768, depth=24, num_heads=12, use_flux=use_flux, num_refiner_blocks=6)
+def DiT_L(img_size=128):
+    return MeanFlowDiT(img_size, hidden_size=768, depth=24, num_heads=12)
 
 MODEL_CONFIGS = {
-    'xs': DualPipeline_XS,
-    'small': DualPipeline_S,
-    'base': DualPipeline_B,
-    'large': DualPipeline_L,
+    'xs': DiT_XS,
+    'small': DiT_S,
+    'base': DiT_B,
+    'large': DiT_L,
 }
 
 
 # ============================================================================
-# Trainer (MeanFlow Strategy + LPIPS Loss)
+# FLUX Feature Loss (FLUX as Judge)
+# ============================================================================
+
+class FLUXFeatureLoss(nn.Module):
+    """
+    Use FLUX VAE Encoder to compute feature-level loss.
+    
+    FLUX is completely frozen - only used to extract features.
+    This encourages the model to produce images that look good
+    in FLUX's latent space (i.e., have FLUX-like textures).
+    
+    Loss = ||FLUX_Encode(x_pred) - FLUX_Encode(HR)||²
+    """
+    def __init__(self):
+        super().__init__()
+        self.vae = None
+        self.flux_loaded = False
+        self.scaling_factor = 1.0
+    
+    def load_flux(self, device='cuda'):
+        """Load FLUX VAE encoder"""
+        if self.flux_loaded:
+            return True
+        
+        try:
+            from diffusers import AutoencoderKL
+            
+            print("[FLUX] Loading FLUX VAE for feature loss...")
+            self.vae = AutoencoderKL.from_pretrained(
+                "black-forest-labs/FLUX.1-dev",
+                subfolder="vae",
+                torch_dtype=torch.float16
+            ).to(device)
+            
+            # Completely freeze
+            self.vae.requires_grad_(False)
+            self.vae.eval()
+            
+            # Get scaling factor
+            if hasattr(self.vae.config, 'scaling_factor'):
+                self.scaling_factor = self.vae.config.scaling_factor
+            
+            self.flux_loaded = True
+            print(f"[FLUX] VAE loaded successfully (scaling_factor={self.scaling_factor})")
+            return True
+            
+        except Exception as e:
+            print(f"[FLUX] Failed to load: {e}")
+            print("[FLUX] Feature loss will be disabled")
+            self.flux_loaded = False
+            return False
+    
+    @torch.no_grad()
+    def encode(self, x):
+        """
+        Encode image to FLUX latent space.
+        
+        Args:
+            x: [B, 3, H, W] in [-1, 1]
+        Returns:
+            latent: [B, 16, H/8, W/8]
+        """
+        if self.vae is None:
+            return None
+        
+        B, C, H, W = x.shape
+        
+        # Pad to multiple of 8
+        pad_h = (8 - H % 8) % 8
+        pad_w = (8 - W % 8) % 8
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+        
+        # Encode (use mean, not sample, for deterministic features)
+        x_half = x.half()
+        latent = self.vae.encode(x_half).latent_dist.mean
+        
+        # Remove padding in latent space
+        if pad_h > 0 or pad_w > 0:
+            lat_h = H // 8
+            lat_w = W // 8
+            latent = latent[:, :, :lat_h, :lat_w]
+        
+        return latent.float()
+    
+    def forward(self, x_pred, hr):
+        """
+        Compute FLUX feature loss.
+        
+        Args:
+            x_pred: [B, 3, H, W] predicted SR image
+            hr: [B, 3, H, W] ground truth HR image
+        
+        Returns:
+            loss: scalar
+        """
+        if not self.flux_loaded or self.vae is None:
+            return torch.tensor(0.0, device=x_pred.device)
+        
+        # Extract features
+        F_pred = self.encode(x_pred)
+        F_hr = self.encode(hr)
+        
+        if F_pred is None or F_hr is None:
+            return torch.tensor(0.0, device=x_pred.device)
+        
+        # L2 loss in FLUX latent space
+        loss = F.mse_loss(F_pred, F_hr)
+        
+        return loss
+
+
+# ============================================================================
+# Trainer
 # ============================================================================
 
 class Trainer:
@@ -604,8 +430,8 @@ class Trainer:
         prop_h0=0.6,
         prop_havg=0.2,
         prop_onestep=0.2,
-        use_lpips=True,
-        lpips_weight=0.1,
+        use_flux_loss=False,
+        flux_loss_weight=0.1,
     ):
         self.model = model.to(device)
         self.device = device
@@ -614,35 +440,33 @@ class Trainer:
         self.prop_h0 = prop_h0
         self.prop_havg = prop_havg
         self.prop_onestep = prop_onestep
-        self.lpips_weight = lpips_weight
+        self.flux_loss_weight = flux_loss_weight
         
-        # LPIPS loss (perceptual)
-        self.use_lpips = use_lpips and LPIPS_AVAILABLE
-        if self.use_lpips:
-            self.lpips_fn = lpips.LPIPS(net='vgg').to(device)
-            self.lpips_fn.requires_grad_(False)
-            print("[Trainer] LPIPS loss enabled (weight={})".format(lpips_weight))
-        else:
-            self.lpips_fn = None
-            if use_lpips and not LPIPS_AVAILABLE:
-                print("[Trainer] LPIPS requested but not available. Using MSE only.")
+        # FLUX Feature Loss
+        self.use_flux_loss = use_flux_loss
+        self.flux_loss_fn = None
+        if use_flux_loss:
+            self.flux_loss_fn = FLUXFeatureLoss()
+            if self.flux_loss_fn.load_flux(device):
+                print(f"[Trainer] FLUX feature loss enabled (weight={flux_loss_weight})")
+            else:
+                self.use_flux_loss = False
+                print("[Trainer] FLUX feature loss disabled (failed to load)")
         
-        # Only optimize trainable parameters
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        self.optimizer = AdamW(trainable_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
+        # Optimizer
+        self.optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
         
         # EMA
         self.ema_decay = 0.9999
-        self.ema_params = {n: p.clone().detach() for n, p in model.named_parameters() if p.requires_grad}
+        self.ema_params = {n: p.clone().detach() for n, p in model.named_parameters()}
     
     def update_ema(self):
         with torch.no_grad():
             for n, p in self.model.named_parameters():
-                if n in self.ema_params:
-                    self.ema_params[n].mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
+                self.ema_params[n].mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
     
     def sample_time(self, batch_size):
-        """MeanFlow time sampling: 60/20/20 strategy"""
+        """MeanFlow 60/20/20 time sampling"""
         n0 = int(batch_size * self.prop_h0)
         na = int(batch_size * self.prop_havg)
         n1 = batch_size - n0 - na
@@ -650,18 +474,15 @@ class Trainer:
         t = torch.zeros(batch_size, device=self.device)
         h = torch.zeros(batch_size, device=self.device)
         
-        # 60%: h=0, t~logit-normal
         if n0 > 0:
             t[:n0] = torch.sigmoid(torch.randn(n0, device=self.device) * self.P_std + self.P_mean)
         
-        # 20%: h>0, average velocity
         if na > 0:
             t1 = torch.sigmoid(torch.randn(na, device=self.device) * self.P_std + self.P_mean)
             t2 = torch.sigmoid(torch.randn(na, device=self.device) * self.P_std + self.P_mean)
             t[n0:n0+na] = torch.maximum(t1, t2)
             h[n0:n0+na] = torch.abs(t1 - t2)
         
-        # 20%: t=1, h=1 (one-step)
         if n1 > 0:
             t[-n1:] = 1.0
             h[-n1:] = 1.0
@@ -689,37 +510,31 @@ class Trainer:
         # Forward
         u = self.model(z_t, lr, t, h)
         
-        # MSE Loss (on velocity)
+        # MSE Loss
         loss_mse = F.mse_loss(u, v_target)
         
-        # LPIPS Loss (on reconstructed image)
-        if self.use_lpips and self.lpips_fn is not None:
-            # Reconstruct predicted image: x_pred = z_t - t * u
-            # For one-step (t=1): x_pred = lr - u
+        # FLUX Feature Loss
+        loss_flux = torch.tensor(0.0, device=self.device)
+        if self.use_flux_loss and self.flux_loss_fn is not None:
+            # Reconstruct predicted image
             x_pred = z_t - t_exp * u
-            
-            # LPIPS expects input in [-1, 1] range (already satisfied)
-            loss_lpips = self.lpips_fn(x_pred, hr).mean()
-            
-            # Combined loss
-            loss = loss_mse + self.lpips_weight * loss_lpips
-        else:
-            loss_lpips = torch.tensor(0.0)
-            loss = loss_mse
+            x_pred = x_pred.clamp(-1, 1)  # Clamp for stability
+            loss_flux = self.flux_loss_fn(x_pred, hr)
+        
+        # Total loss
+        loss = loss_mse + self.flux_loss_weight * loss_flux
         
         # Backward
         self.optimizer.zero_grad()
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in self.model.parameters() if p.requires_grad], 1.0
-        )
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         self.update_ema()
         
         return {
             'loss': loss.item(),
             'loss_mse': loss_mse.item(),
-            'loss_lpips': loss_lpips.item() if self.use_lpips else 0.0,
+            'loss_flux': loss_flux.item() if self.use_flux_loss else 0.0,
             'grad_norm': grad_norm.item(),
         }
     
@@ -728,10 +543,9 @@ class Trainer:
         self.model.eval()
         
         if use_ema:
-            orig = {n: p.clone() for n, p in self.model.named_parameters() if n in self.ema_params}
+            orig = {n: p.clone() for n, p in self.model.named_parameters()}
             for n, p in self.model.named_parameters():
-                if n in self.ema_params:
-                    p.data.copy_(self.ema_params[n])
+                p.data.copy_(self.ema_params[n])
         
         x = lr_images.clone()
         dt = 1.0 / num_steps
@@ -743,8 +557,7 @@ class Trainer:
         
         if use_ema:
             for n, p in self.model.named_parameters():
-                if n in orig:
-                    p.data.copy_(orig[n])
+                p.data.copy_(orig[n])
         
         return x
     
@@ -791,7 +604,7 @@ class Trainer:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Dual-Pipeline SR with Delta Learning')
+    parser = argparse.ArgumentParser(description='MeanFlow SR with FLUX Feature Loss')
     
     # Data
     parser.add_argument('--hr_dir', type=str, required=True)
@@ -803,7 +616,6 @@ def main():
     # Model
     parser.add_argument('--model_size', type=str, default='small', choices=['xs', 'small', 'base', 'large'])
     parser.add_argument('--patch_size', type=int, default=128)
-    parser.add_argument('--use_flux', action='store_true', help='Use FLUX for detail enhancement')
     
     # Training
     parser.add_argument('--epochs', type=int, default=100)
@@ -811,9 +623,9 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     
-    # Loss
-    parser.add_argument('--use_lpips', action='store_true', help='Use LPIPS perceptual loss')
-    parser.add_argument('--lpips_weight', type=float, default=0.1, help='Weight for LPIPS loss')
+    # FLUX Loss
+    parser.add_argument('--use_flux_loss', action='store_true', help='Use FLUX feature loss')
+    parser.add_argument('--flux_loss_weight', type=float, default=0.1, help='Weight for FLUX loss')
     
     # MeanFlow
     parser.add_argument('--prop_h0', type=float, default=0.6)
@@ -833,16 +645,15 @@ def main():
     # Save dir
     if args.save_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        flux_str = "flux" if args.use_flux else "noflux"
+        flux_str = f"fluxloss{args.flux_loss_weight}" if args.use_flux_loss else "baseline"
         args.save_dir = os.path.join(args.save_base, f"{ts}_{args.model_size}_x{args.scale}_{flux_str}")
     os.makedirs(args.save_dir, exist_ok=True)
     
     print("=" * 70)
-    print("Dual-Pipeline SR with Delta Learning")
+    print("MeanFlow SR with FLUX Feature Loss (V1 Base)")
     print("=" * 70)
     print(f"Model: {args.model_size} | Scale: {args.scale}x | Patch: {args.patch_size}")
-    print(f"Use FLUX: {args.use_flux}")
-    print(f"Use LPIPS: {args.use_lpips} (weight={args.lpips_weight})")
+    print(f"FLUX Loss: {args.use_flux_loss} (weight={args.flux_loss_weight})")
     print(f"MeanFlow: {args.prop_h0}/{args.prop_havg}/{args.prop_onestep}")
     print(f"Save: {args.save_dir}")
     print("=" * 70)
@@ -860,23 +671,16 @@ def main():
         val_loader = DataLoader(val_data, 4, shuffle=False, num_workers=2)
     
     # Model
-    model = MODEL_CONFIGS[args.model_size](args.patch_size, use_flux=args.use_flux)
+    model = MODEL_CONFIGS[args.model_size](args.patch_size)
     
-    # Load FLUX if needed
-    if args.use_flux:
-        model.load_flux(device)
-    
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Parameters: {total_params:,}")
     
     # Trainer
     trainer = Trainer(
         model, device, args.lr, args.weight_decay,
         prop_h0=args.prop_h0, prop_havg=args.prop_havg, prop_onestep=args.prop_onestep,
-        use_lpips=args.use_lpips, lpips_weight=args.lpips_weight,
+        use_flux_loss=args.use_flux_loss, flux_loss_weight=args.flux_loss_weight,
     )
     
     start_epoch = 0
@@ -891,35 +695,43 @@ def main():
     train_start = time.time()
     
     for epoch in range(start_epoch, args.epochs):
-        losses = []
+        losses, losses_mse, losses_flux = [], [], []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         
         for batch in pbar:
             metrics = trainer.train_step(batch)
             losses.append(metrics['loss'])
-            if args.use_lpips:
+            losses_mse.append(metrics['loss_mse'])
+            losses_flux.append(metrics['loss_flux'])
+            
+            if args.use_flux_loss:
                 pbar.set_postfix({
                     'loss': f"{metrics['loss']:.4f}",
                     'mse': f"{metrics['loss_mse']:.4f}",
-                    'lpips': f"{metrics['loss_lpips']:.4f}"
+                    'flux': f"{metrics['loss_flux']:.4f}"
                 })
             else:
                 pbar.set_postfix({'loss': f"{metrics['loss']:.4f}"})
         
         scheduler.step()
         avg_loss = np.mean(losses)
+        avg_mse = np.mean(losses_mse)
+        avg_flux = np.mean(losses_flux)
         
         # Validation
         if val_loader:
             psnr = trainer.validate(val_loader)
-            print(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={psnr:.2f}dB")
+            if args.use_flux_loss:
+                print(f"Epoch {epoch+1}: loss={avg_loss:.6f} (mse={avg_mse:.6f}, flux={avg_flux:.6f}), PSNR={psnr:.2f}dB")
+            else:
+                print(f"Epoch {epoch+1}: loss={avg_loss:.6f}, PSNR={psnr:.2f}dB")
             
             if psnr > best_psnr:
                 best_psnr = psnr
                 trainer.save(os.path.join(args.save_dir, 'best_model.pt'), epoch, avg_loss, psnr)
                 print("  -> Saved best!")
         else:
-            print(f"Epoch {epoch+1}: Loss={avg_loss:.6f}")
+            print(f"Epoch {epoch+1}: loss={avg_loss:.6f}")
         
         # Periodic save
         if (epoch + 1) % 20 == 0:
@@ -932,6 +744,7 @@ def main():
     print(f"\nTraining complete!")
     print(f"Best PSNR: {best_psnr:.2f} dB")
     print(f"Total time: {total_time/3600:.2f} hours")
+    print(f"Checkpoint: {args.save_dir}")
 
 
 if __name__ == '__main__':
