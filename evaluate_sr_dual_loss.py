@@ -5,7 +5,7 @@ This evaluates models trained with train_sr_dual_v1_flux_loss.py
 Model architecture: Simple DiT (V1, 3ch input)
 
 Usage:
-    python evaluate_sr_dual_v1_flux_loss.py \
+    python evaluate_sr_dual_loss.py \
         --checkpoint checkpoints/dual/.../best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
