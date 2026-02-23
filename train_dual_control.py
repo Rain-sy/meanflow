@@ -1,22 +1,19 @@
 #!/usr/bin/env python
 """
-Dual-Stream FLUX SR ControlNet Training (Accelerate Version)
+Dual-Stream FLUX SR ControlNet Training
 
 核心思想：突破 VAE 的"马赛克瓶颈"
 - Latent Stream: FLUX ControlNet 负责结构、语义、细节生成
 - Pixel Stream: 轻量 CNN 提取高频边缘特征，无损注入到 Latent Stream
 
-关键技术：
-1. Zero Conv 初始化 - 不破坏预训练权重
-2. MeanFlow 条件流匹配 - 从 LR 出发而非纯噪声
-3. GroupNorm 稳定训练
+关键技术：Zero Conv 初始化
+- 初始时 Pixel 特征全为 0，不破坏预训练 ControlNet
+- 训练过程中逐渐学习有用的高频特征
 
 Usage:
-    accelerate launch --num_processes=4 train_dual_control.py \
+    deepspeed --num_gpus=4 train_dual_control.py \
         --hr_dir Data/DIV2K/DIV2K_train_HR \
         --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --epochs 100 --lr 1e-5
 """
 
@@ -33,20 +30,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from accelerate import Accelerator
-from accelerate.utils import set_seed
+import deepspeed
 from tqdm import tqdm
 
 
 # ============================================================================
-# Pixel Feature Extractor (with GroupNorm for stability)
+# Pixel Feature Extractor (轻量级高频特征提取器)
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
     """
     从原始像素空间提取高频特征，并映射到 Latent 空间维度。
     使用 Zero Conv 确保初始化时不破坏预训练 ControlNet。
-    使用 GroupNorm 稳定训练。
     
     Input: RGB image [B, 3, H, W] (H, W = 512)
     Output: Latent-space features [B, 16, H/8, W/8] (64x64)
@@ -55,30 +50,23 @@ class PixelFeatureExtractor(nn.Module):
         super().__init__()
         
         # 编码器：3 通道 RGB → 16 通道 Latent 维度，stride=8 匹配空间分辨率
-        # 🌟 加入 GroupNorm 稳定训练
         self.encoder = nn.Sequential(
             # 512 → 256
             nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
             nn.SiLU(),
             nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 32),
             nn.SiLU(),
             
             # 256 → 128
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
             nn.SiLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 64),
             nn.SiLU(),
             
             # 128 → 64
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
             nn.SiLU(),
             nn.Conv2d(128, latent_channels, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(4, latent_channels),
             nn.SiLU(),
         )
         
@@ -277,6 +265,16 @@ class DualStreamFLUXSR(nn.Module):
     def forward(self, noisy, lr_lat, lr_pixel, t, guidance=3.5):
         """
         Dual-Stream Forward Pass
+        
+        Args:
+            noisy: [B, 16, H, W] - Noisy latent
+            lr_lat: [B, 16, H, W] - LR latent from VAE
+            lr_pixel: [B, 3, H*8, W*8] - Original LR pixel image (bicubic upscaled)
+            t: [B] - Timesteps
+            guidance: float - Guidance scale
+        
+        Returns:
+            v_pred: [B, 16, H, W] - Predicted velocity
         """
         B, C, H, W = noisy.shape
         device, dtype = noisy.device, noisy.dtype
@@ -300,7 +298,7 @@ class DualStreamFLUXSR(nn.Module):
         # ControlNet forward
         ctrl_kwargs = {
             'hidden_states': packed_noisy,
-            'controlnet_cond': packed_cond,
+            'controlnet_cond': packed_cond,  # 使用融合后的条件
             'timestep': t,
             'encoder_hidden_states': prompt,
             'pooled_projections': pooled,
@@ -336,15 +334,21 @@ class DualStreamFLUXSR(nn.Module):
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5):
         """
-        Dual-Stream Inference (MeanFlow style: start from LR, not noise)
+        Dual-Stream Inference
+        
+        Args:
+            lr_lat: [B, 16, H, W] - LR latent
+            lr_pixel: [B, 3, H*8, W*8] - LR pixel image
+            num_steps: int - Number of denoising steps
+            guidance: float - Guidance scale
+        
+        Returns:
+            sr_lat: [B, 16, H, W] - SR latent
         """
         B = lr_lat.shape[0]
         
-        # 🌟 MeanFlow: 从 LR latent 出发，而非纯噪声
-        sigma = 0.1
-        noise = torch.randn_like(lr_lat)
-        lat = lr_lat + sigma * noise
-        
+        # Start from random noise
+        lat = torch.randn_like(lr_lat)
         dt = 1.0 / num_steps
         
         for i in range(num_steps):
@@ -362,30 +366,36 @@ class DualStreamFLUXSR(nn.Module):
 
 def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel):
     """
-    🌟 MeanFlow 条件流匹配 Loss
+    Compute Flow Matching loss for Dual-Stream system
     
-    核心改进：从 LR latent 出发而非纯噪声，让模型学习 LR → HR 的精确变换
+    Args:
+        system: DualStreamFLUXSR model
+        hr_lat: [B, 16, H, W] - HR latent (target)
+        lr_lat: [B, 16, H, W] - LR latent (condition)
+        lr_pixel: [B, 3, H*8, W*8] - LR pixel image
+    
+    Returns:
+        loss: scalar tensor
     """
     B = hr_lat.shape[0]
-    device, dtype = hr_lat.device, hr_lat.dtype
+    device = hr_lat.device
+    dtype = hr_lat.dtype
     
     # Sample timestep
     t = torch.rand(B, device=device, dtype=dtype)
+    
+    # Sample noise
     noise = torch.randn_like(hr_lat)
     
-    # 🌟 MeanFlow: 起点从纯噪声平移到 LR latent
-    # 加入 0.1 倍噪声保持生成多样性，防止模式崩溃
-    sigma = 0.1
-    x_start = lr_lat + sigma * noise
-    
-    # 轨迹：从 x_start (起点) 流向 hr_lat (终点)
+    # Create noisy latent (linear interpolation)
+    # z_t = (1 - t) * x_0 + t * noise
     t_expand = t.view(B, 1, 1, 1)
-    z_t = (1 - t_expand) * hr_lat + t_expand * x_start
+    z_t = (1 - t_expand) * hr_lat + t_expand * noise
     
-    # 目标速度：指向起点
-    v_target = x_start - hr_lat
+    # Target velocity: noise - x_0
+    v_target = noise - hr_lat
     
-    # 预测速度
+    # Predict velocity (with Dual-Stream conditioning)
     v_pred = system(z_t, lr_lat, lr_pixel, t)
     
     # MSE Loss
@@ -432,23 +442,21 @@ def validate(system, val_loader, device, num_samples=5, num_steps=20):
     return np.mean(psnr_list) if psnr_list else 0.0
 
 
-def save_checkpoint(system, epoch, loss, psnr, path):
-    """
-    🌟 修复: 只保存模型权重，不保存 optimizer（防止多卡碎片化问题）
-    """
-    # 获取实际模型（处理各种包装）
-    def unwrap(model):
-        if hasattr(model, 'module'):
-            return unwrap(model.module)
-        return model
-    
-    controlnet = unwrap(system.controlnet)
-    pixel_extractor = unwrap(system.pixel_extractor)
+def save_checkpoint(system, optimizer, epoch, loss, psnr, path):
+    """Save checkpoint with module prefix handling"""
+    # Handle DeepSpeed wrapped model
+    if hasattr(system, 'module'):
+        controlnet_state = system.module.controlnet.state_dict()
+        pixel_extractor_state = system.module.pixel_extractor.state_dict()
+    else:
+        controlnet_state = system.controlnet.state_dict()
+        pixel_extractor_state = system.pixel_extractor.state_dict()
     
     torch.save({
         'epoch': epoch,
-        'controlnet': controlnet.state_dict(),
-        'pixel_extractor': pixel_extractor.state_dict(),
+        'controlnet': controlnet_state,
+        'pixel_extractor': pixel_extractor_state,
+        'optimizer': optimizer.state_dict() if optimizer else None,
         'loss': loss,
         'psnr': psnr,
     }, path)
@@ -485,48 +493,39 @@ def main():
     parser.add_argument('--val_interval', type=int, default=5)
     parser.add_argument('--save_interval', type=int, default=10)
     
+    # DeepSpeed
+    parser.add_argument('--local_rank', type=int, default=0)
+    
     # Output
     parser.add_argument('--output_dir', type=str, default='./checkpoints/dual_control')
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--seed', type=int, default=42)
     
     args = parser.parse_args()
     
-    # Initialize Accelerator
-    accelerator = Accelerator(
-        mixed_precision='bf16',
-        gradient_accumulation_steps=1,
-    )
-    
-    device = accelerator.device
-    is_main = accelerator.is_main_process  # 🌟 用于控制只在主进程打印/保存
-    
-    # Set seed
-    set_seed(args.seed)
+    # Setup
+    device = torch.device(f'cuda:{args.local_rank}')
+    torch.cuda.set_device(device)
     
     # Determine if training ControlNet
     train_controlnet = args.train_controlnet and not args.freeze_controlnet
     
-    # Create output directory (only main process)
+    # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode = "ctrl+pixel" if train_controlnet else "pixel_only"
     save_dir = os.path.join(args.output_dir, f"{timestamp}_{mode}")
+    os.makedirs(save_dir, exist_ok=True)
     
-    if is_main:
-        os.makedirs(save_dir, exist_ok=True)
-        
-        print("=" * 70)
-        print("Dual-Stream FLUX SR ControlNet Training (Accelerate)")
-        print("=" * 70)
-        print(f"Model: {args.model_name}")
-        print(f"ControlNet: {args.pretrained_controlnet}")
-        print(f"Mode: {'ControlNet + Pixel Extractor' if train_controlnet else 'Pixel Extractor only'}")
-        print(f"Resolution: {args.resolution}")
-        print(f"Epochs: {args.epochs}")
-        print(f"Learning rate: {args.lr}")
-        print(f"Output: {save_dir}")
-        print(f"GPUs: {accelerator.num_processes}")
-        print("=" * 70)
+    print("=" * 70)
+    print("Dual-Stream FLUX SR ControlNet Training")
+    print("=" * 70)
+    print(f"Model: {args.model_name}")
+    print(f"ControlNet: {args.pretrained_controlnet}")
+    print(f"Mode: {'ControlNet + Pixel Extractor' if train_controlnet else 'Pixel Extractor only'}")
+    print(f"Resolution: {args.resolution}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Output: {save_dir}")
+    print("=" * 70)
     
     # Create model
     system = DualStreamFLUXSR(
@@ -539,47 +538,56 @@ def main():
     # Get trainable parameters
     trainable_params = system.get_trainable_params()
     total_params = sum(p.numel() for p in trainable_params)
-    if is_main:
-        print(f"[Training] Trainable parameters: {total_params:,}")
+    print(f"[Training] Trainable parameters: {total_params:,}")
     
     # Create datasets
     train_dataset = SRDataset(args.hr_dir, args.lr_dir, args.resolution)
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    if is_main:
-        print(f"[Data] Training samples: {len(train_dataset)}")
+    print(f"[Data] Training samples: {len(train_dataset)}")
     
     val_loader = None
     if args.val_hr_dir and args.val_lr_dir:
         val_dataset = SRDataset(args.val_hr_dir, args.val_lr_dir, args.resolution)
         val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
-        if is_main:
-            print(f"[Data] Validation samples: {len(val_dataset)}")
+        print(f"[Data] Validation samples: {len(val_dataset)}")
     
-    # Optimizer
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
+    # DeepSpeed config
+    ds_config = {
+        "train_batch_size": args.batch_size,
+        "gradient_accumulation_steps": 1,
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": args.lr,
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "weight_decay": 0.01
+            }
+        },
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": args.lr,
+                "warmup_num_steps": args.warmup_epochs * len(train_dataset),
+                "total_num_steps": args.epochs * len(train_dataset)
+            }
+        },
+        "bf16": {"enabled": True},
+        "zero_optimization": {
+            "stage": 2,
+            "offload_optimizer": {"device": "none"},
+            "contiguous_gradients": True,
+            "overlap_comm": True
+        },
+        "gradient_clipping": 1.0
+    }
     
-    # Learning rate scheduler with warmup
-    num_training_steps = args.epochs * len(train_loader)
-    num_warmup_steps = args.warmup_epochs * len(train_loader)
-    
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    # Prepare with Accelerator
-    system.controlnet, system.pixel_extractor, optimizer, train_loader, scheduler = accelerator.prepare(
-        system.controlnet, system.pixel_extractor, optimizer, train_loader, scheduler
+    # Initialize DeepSpeed
+    model_engine, optimizer, train_loader, _ = deepspeed.initialize(
+        model=system,
+        model_parameters=trainable_params,
+        training_data=train_dataset,
+        config=ds_config
     )
     
     # Resume if specified
@@ -587,40 +595,33 @@ def main():
     best_psnr = 0.0
     
     if args.resume:
-        if is_main:
-            print(f"[Resume] Loading from {args.resume}")
+        print(f"[Resume] Loading from {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         
         # Load Pixel Extractor
-        pixel_ext = system.pixel_extractor.module if hasattr(system.pixel_extractor, 'module') else system.pixel_extractor
-        raw_state = ckpt['pixel_extractor']
-        clean_state = {k.replace('module.', ''): v for k, v in raw_state.items()}
-        pixel_ext.load_state_dict(clean_state)
+        system.pixel_extractor.load_state_dict(ckpt['pixel_extractor'])
         
         # Load ControlNet if training it
         if train_controlnet and 'controlnet' in ckpt:
-            ctrl = system.controlnet.module if hasattr(system.controlnet, 'module') else system.controlnet
             raw_state = ckpt['controlnet']
             clean_state = {k.replace('module.', ''): v for k, v in raw_state.items()}
-            ctrl.load_state_dict(clean_state)
+            system.controlnet.load_state_dict(clean_state)
         
         start_epoch = ckpt.get('epoch', 0) + 1
         best_psnr = ckpt.get('psnr', 0.0)
-        if is_main:
-            print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}")
+        print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}")
     
     # Training history
     history = {'train_loss': [], 'val_psnr': []}
     
     # Training loop
-    if is_main:
-        print("\n[Training] Starting...\n")
+    print("\n[Training] Starting...\n")
     
     for epoch in range(start_epoch, args.epochs):
-        system.train()
+        model_engine.train()
         epoch_losses = []
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not is_main)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         
         for batch in pbar:
             hr = batch['hr'].to(device)
@@ -631,83 +632,69 @@ def main():
                 hr_lat = system.encode(hr)
                 lr_lat = system.encode(lr)
             
-            # Compute loss
-            with accelerator.accumulate(system.controlnet, system.pixel_extractor):
-                loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr)
-                
-                # Backward
-                accelerator.backward(loss)
-                
-                # Gradient clipping
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(trainable_params, 1.0)
-                
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+            # Compute loss (lr is also the pixel input)
+            loss = compute_flow_matching_loss(model_engine, hr_lat, lr_lat, lr)
+            
+            # Backward
+            model_engine.backward(loss)
+            model_engine.step()
             
             epoch_losses.append(loss.item())
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.2e}'})
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
         avg_loss = np.mean(epoch_losses)
         history['train_loss'].append(avg_loss)
         
-        # 🌟 Validation and saving only on main process
-        if is_main:
-            val_psnr = 0.0
-            if val_loader and (epoch + 1) % args.val_interval == 0:
-                val_psnr = validate(system, val_loader, device, num_samples=5)
-                history['val_psnr'].append(val_psnr)
-                print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}, Val PSNR: {val_psnr:.2f} dB")
-            else:
-                print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}")
-            
-            # Save checkpoint
-            if (epoch + 1) % args.save_interval == 0:
-                save_checkpoint(
-                    system, epoch, avg_loss, val_psnr,
-                    os.path.join(save_dir, f'epoch{epoch+1}.pt')
-                )
-            
-            # Save best model
-            if val_psnr > best_psnr:
-                best_psnr = val_psnr
-                save_checkpoint(
-                    system, epoch, avg_loss, val_psnr,
-                    os.path.join(save_dir, 'best_model.pt')
-                )
-                print(f"[Epoch {epoch+1}] ✓ New best PSNR: {best_psnr:.2f} dB")
+        # Validation
+        val_psnr = 0.0
+        if val_loader and (epoch + 1) % args.val_interval == 0:
+            val_psnr = validate(system, val_loader, device, num_samples=5)
+            history['val_psnr'].append(val_psnr)
+            print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}, Val PSNR: {val_psnr:.2f} dB")
+        else:
+            print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}")
         
-        # Synchronize
-        accelerator.wait_for_everyone()
+        # Save checkpoint
+        if (epoch + 1) % args.save_interval == 0:
+            save_checkpoint(
+                model_engine, optimizer, epoch, avg_loss, val_psnr,
+                os.path.join(save_dir, f'epoch{epoch+1}.pt')
+            )
+        
+        # Save best model
+        if val_psnr > best_psnr:
+            best_psnr = val_psnr
+            save_checkpoint(
+                model_engine, optimizer, epoch, avg_loss, val_psnr,
+                os.path.join(save_dir, 'best_model.pt')
+            )
+            print(f"[Epoch {epoch+1}] ✓ New best PSNR: {best_psnr:.2f} dB")
     
-    # Save final model (main process only)
-    if is_main:
-        save_checkpoint(
-            system, args.epochs - 1, avg_loss, best_psnr,
-            os.path.join(save_dir, 'final_model.pt')
-        )
-        
-        # Save training summary
-        summary_path = os.path.join(save_dir, 'training_summary.txt')
-        with open(summary_path, 'w') as f:
-            f.write("Dual-Stream FLUX SR ControlNet Training Summary\n")
-            f.write("=" * 50 + "\n")
-            f.write(f"Model: {args.model_name}\n")
-            f.write(f"ControlNet: {args.pretrained_controlnet}\n")
-            f.write(f"Mode: {'ControlNet + Pixel Extractor' if train_controlnet else 'Pixel Extractor only'}\n")
-            f.write(f"Resolution: {args.resolution}\n")
-            f.write(f"Epochs: {args.epochs}\n")
-            f.write(f"Learning rate: {args.lr}\n")
-            f.write(f"GPUs: {accelerator.num_processes}\n")
-            f.write(f"Best PSNR: {best_psnr:.2f} dB\n")
-            f.write(f"Final loss: {avg_loss:.6f}\n")
-        
-        print("\n" + "=" * 70)
-        print("Training Complete!")
-        print(f"Best PSNR: {best_psnr:.2f} dB")
-        print(f"Checkpoints saved to: {save_dir}")
-        print("=" * 70)
+    # Save final model
+    save_checkpoint(
+        model_engine, optimizer, args.epochs - 1, avg_loss, val_psnr,
+        os.path.join(save_dir, 'final_model.pt')
+    )
+    
+    # Save training summary
+    summary_path = os.path.join(save_dir, 'training_summary.txt')
+    with open(summary_path, 'w') as f:
+        f.write("Dual-Stream FLUX SR ControlNet Training Summary\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Model: {args.model_name}\n")
+        f.write(f"ControlNet: {args.pretrained_controlnet}\n")
+        f.write(f"Mode: {'ControlNet + Pixel Extractor' if train_controlnet else 'Pixel Extractor only'}\n")
+        f.write(f"Resolution: {args.resolution}\n")
+        f.write(f"Epochs: {args.epochs}\n")
+        f.write(f"Learning rate: {args.lr}\n")
+        f.write(f"Best PSNR: {best_psnr:.2f} dB\n")
+        f.write(f"Final loss: {avg_loss:.6f}\n")
+    
+    print("\n" + "=" * 70)
+    print("Training Complete!")
+    print(f"Best PSNR: {best_psnr:.2f} dB")
+    print(f"Checkpoints saved to: {save_dir}")
+    print("=" * 70)
 
 
 if __name__ == '__main__':
