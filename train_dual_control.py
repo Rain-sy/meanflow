@@ -458,7 +458,7 @@ def validate(system, val_loader, device, num_samples=5, num_steps=20):
     return np.mean(psnr_list) if psnr_list else 0.0
 
 
-def save_checkpoint(system, epoch, loss, psnr, path):
+def save_checkpoint(system, accelerator, epoch, loss, psnr, path):
     # 🌟 强制脱壳获取原始模型
     unwrapped_sys = accelerator.unwrap_model(system)
     
@@ -739,7 +739,7 @@ def main():
             # Save checkpoint
             if (epoch + 1) % args.save_interval == 0:
                 save_checkpoint(
-                    system, epoch, avg_loss, val_psnr,
+                    system, accelerator, epoch, avg_loss, val_psnr,
                     os.path.join(save_dir, f'epoch{epoch+1}.pt')
                 )
             
@@ -747,7 +747,7 @@ def main():
             if val_psnr > best_psnr:
                 best_psnr = val_psnr
                 save_checkpoint(
-                    system, epoch, avg_loss, val_psnr,
+                    system, accelerator, epoch, avg_loss, val_psnr,
                     os.path.join(save_dir, 'best_model.pt')
                 )
                 print(f"[Epoch {epoch+1}] ✓ New best PSNR: {best_psnr:.2f} dB")
@@ -758,7 +758,7 @@ def main():
     # Save final model (main process only)
     if is_main:
         save_checkpoint(
-            system, args.epochs - 1, avg_loss, best_psnr,
+            system, accelerator, args.epochs - 1, avg_loss, best_psnr,
             os.path.join(save_dir, 'final_model.pt')
         )
         
