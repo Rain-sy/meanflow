@@ -1,167 +1,65 @@
 #!/usr/bin/env python
 """
 Dual-Stream FLUX SR Evaluation with CLEAR Acceleration
-
-支持高分辨率推理，使用 CLEAR 局部注意力加速
-
-Usage:
-    python evaluate_dual_control_clear.py \
-        --checkpoint checkpoints/best_model.pt \
-        --input_dir test_images/LR \
-        --output_dir results/SR \
-        --window_size 16
 """
 
 import os
-import argparse
-import time
+import sys
+
+# 🌟 必须在导入 torch 之前设置这些环境变量
+os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+os.environ["TORCH_LOGS"] = "-all"
+os.environ["TORCH_COMPILE_DEBUG"] = "0"
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torchinductor_cache"
+
 import gc
+import argparse
+import numpy as np
 from PIL import Image
-from functools import partial, lru_cache
+from datetime import datetime
+from tqdm import tqdm
+
+import warnings
+warnings.filterwarnings("ignore")
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from tqdm import tqdm
 
-# 🌟 必须加上：防止 Triton 编译时共享内存溢出
-import torch._inductor.config as inductor_config
-inductor_config.max_autotune = True
-inductor_config.coordinate_descent_tuning = True
+# 🌟 CLEAR 需要的 inductor 配置
+try:
+    import torch._inductor.config as inductor_config
+    inductor_config.max_autotune = True
+    inductor_config.coordinate_descent_tuning = True
+    inductor_config.verbose_progress = False
+    inductor_config.benchmark_kernel = False
+    inductor_config.autotune_in_subproc = False
+    inductor_config.trace.enabled = False
+except:
+    pass
 
+# 禁用所有 torch 相关日志
+import logging
+for name in ['torch', 'torch._dynamo', 'torch._inductor', 'torch._functorch', 'torch.fx', 'triton']:
+    logging.getLogger(name).setLevel(logging.CRITICAL)
 
-# ============================================================================
-# CLEAR: Local Attention Mask & Processor
-# ============================================================================
+try:
+    import torch._inductor.config as inductor_config
+    inductor_config.max_autotune = True
+    inductor_config.coordinate_descent_tuning = True
+except:
+    pass
 
-BLOCK_MASK = None
-LATENT_HEIGHT = None
-LATENT_WIDTH = None
-
-
-@lru_cache
-def init_local_mask_flex(height, width, text_length, window_size, device):
-    """初始化 CLEAR 的局部注意力 mask"""
-    from torch.nn.attention.flex_attention import create_block_mask
-    create_block_mask_compiled = torch.compile(create_block_mask)
-    
-    def local_mask(b, h, q_idx, kv_idx):
-        q_y = (q_idx - text_length) // width
-        q_x = (q_idx - text_length) % width
-        kv_y = (kv_idx - text_length) // width
-        kv_x = (kv_idx - text_length) % width
-        
-        return torch.logical_or(
-            torch.logical_or(q_idx < text_length, kv_idx < text_length),
-            (q_y - kv_y) ** 2 + (q_x - kv_x) ** 2 < window_size ** 2
-        )
-    
-    global BLOCK_MASK, LATENT_HEIGHT, LATENT_WIDTH
-    
-    total_len = text_length + height * width
-    BLOCK_MASK = create_block_mask_compiled(
-        local_mask, B=None, H=None, device=device,
-        Q_LEN=total_len, KV_LEN=total_len, _compile=True
-    )
-    LATENT_HEIGHT = height
-    LATENT_WIDTH = width
-    
-    return BLOCK_MASK
-
-
-class LocalFlexAttnProcessor:
-    """CLEAR 的局部注意力处理器"""
-    
-    def __init__(self):
-        import math
-        from torch.nn.attention.flex_attention import flex_attention
-        
-        assert BLOCK_MASK is not None
-        self.flex_attn = partial(flex_attention, block_mask=BLOCK_MASK)
-        self.flex_attn = torch.compile(self.flex_attn, dynamic=False)
-    
-    def __call__(
-        self,
-        attn,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask=None,
-        image_rotary_emb=None,
-        **kwargs
-    ) -> torch.FloatTensor:
-        import math
-        from diffusers.models.embeddings import apply_rotary_emb
-        
-        batch_size = hidden_states.shape[0]
-        
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-        
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-        
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-        
-        if encoder_hidden_states is not None:
-            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
-            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
-            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
-            
-            encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-            encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-            encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-            
-            if attn.norm_added_q is not None:
-                encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
-            if attn.norm_added_k is not None:
-                encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
-            
-            query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
-            key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
-            value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)
-        
-        if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb)
-            key = apply_rotary_emb(key, image_rotary_emb)
-        
-        attention_scale = math.sqrt(1 / head_dim)
-        
-        hidden_states = self.flex_attn(query, key, value, scale=attention_scale)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-        hidden_states = hidden_states.to(query.dtype)
-        
-        if encoder_hidden_states is not None:
-            encoder_hidden_states, hidden_states = (
-                hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1]:],
-            )
-            
-            hidden_states = attn.to_out[0](hidden_states)
-            hidden_states = attn.to_out[1](hidden_states)
-            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
-            
-            return hidden_states, encoder_hidden_states
-        else:
-            return hidden_states
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("Note: lpips not installed. Run: pip install lpips")
 
 
 # ============================================================================
-# Pixel Feature Extractor
+# Pixel Feature Extractor (与训练代码完全一致)
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
@@ -170,25 +68,17 @@ class PixelFeatureExtractor(nn.Module):
         
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
+            nn.GroupNorm(8, 32), nn.SiLU(),
             nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            
+            nn.GroupNorm(8, 32), nn.SiLU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
+            nn.GroupNorm(8, 64), nn.SiLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            
+            nn.GroupNorm(8, 64), nn.SiLU(),
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.SiLU(),
+            nn.GroupNorm(8, 128), nn.SiLU(),
             nn.Conv2d(128, latent_channels, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(4, latent_channels),
-            nn.SiLU(),
+            nn.GroupNorm(4, latent_channels), nn.SiLU(),
         )
         
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
@@ -196,121 +86,225 @@ class PixelFeatureExtractor(nn.Module):
         nn.init.zeros_(self.zero_conv.bias)
     
     def forward(self, x):
-        feat = self.encoder(x)
-        return self.zero_conv(feat)
+        return self.zero_conv(self.encoder(x))
 
 
 # ============================================================================
-# Dual-Stream FLUX SR System with CLEAR
+# Metrics
 # ============================================================================
 
-class DualStreamFLUXSR_CLEAR:
-    """Dual-Stream FLUX SR with CLEAR for inference"""
-    
-    def __init__(self, model_name, device, pretrained_controlnet,
-                 checkpoint_path, window_size=16, down_factor=4, use_clear=True):
+def calculate_psnr(img1, img2):
+    mse = np.mean((img1.astype(np.float64) - img2.astype(np.float64)) ** 2)
+    return float('inf') if mse == 0 else 10 * np.log10(255.0 ** 2 / mse)
+
+
+def calculate_ssim(img1, img2):
+    C1, C2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    img1, img2 = img1.astype(np.float64), img2.astype(np.float64)
+    mu1, mu2 = img1.mean(), img2.mean()
+    sigma1_sq, sigma2_sq = img1.var(), img2.var()
+    sigma12 = ((img1 - mu1) * (img2 - mu2)).mean()
+    return ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / ((mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2))
+
+
+# ============================================================================
+# Evaluator (完全匹配训练代码)
+# ============================================================================
+
+class DualStreamEvaluator:
+    def __init__(self, model_name, device, checkpoint_path=None, pixel_weight=0.1,
+                 window_size=16, down_factor=4, clear_ckpt="ckpt/clear_local_16_down_4.safetensors"):
+        self.model_name = model_name
         self.device = device
+        self.checkpoint_path = checkpoint_path
+        self.pixel_weight = pixel_weight
         self.window_size = window_size
-        self.down_factor = down_factor # 🌟 必须知道训练时的 down_factor
-        self.use_clear = use_clear
+        self.down_factor = down_factor
+        self.clear_ckpt = clear_ckpt
         
-        self._load_models(model_name, pretrained_controlnet, checkpoint_path)
+        self.vae = None
+        self.transformer = None
+        self.controlnet = None
+        self.pixel_extractor = None
+        self._cached_embeds = None
+        
+        # 记录当前 mask 对应的分辨率，避免重复初始化
+        self._current_mask_size = None
     
-    def _load_models(self, model_name, pretrained_controlnet, checkpoint_path):
-        # 🌟 直接从旁边的文件导入
-        from transformer_flux import FluxTransformer2DModel 
+    def load(self):
+        from transformer_flux import FluxTransformer2DModel  # 🌟 使用 CLEAR 版本
         from diffusers import AutoencoderKL, FluxControlNetModel
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+        from safetensors.torch import load_file
+        from attention_processor import (
+            LocalDownsampleFlexAttnProcessor,
+            LocalFlexAttnProcessor,
+            init_local_downsample_mask_flex,
+            init_local_mask_flex
+        )
         
         dtype = torch.bfloat16
+        print(f"[Eval] Loading models (CLEAR: w={self.window_size}, d={self.down_factor})...", end=" ", flush=True)
         
-        print("Loading VAE...")
+        # Load VAE
         self.vae = AutoencoderKL.from_pretrained(
-            model_name, subfolder="vae", torch_dtype=dtype
+            self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
         self.vae.requires_grad_(False)
-        self.vae.enable_tiling()
+        print("VAE", end=" ", flush=True)
         
-        # ... (保留你原有的 Text Encoder 加载和 Cache 代码) ...
-        # (这部分写得很好，无需改动)
+        # Cache text embeddings (与训练完全一致)
+        text_enc = CLIPTextModel.from_pretrained(
+            self.model_name, subfolder="text_encoder", torch_dtype=dtype
+        ).to(self.device)
+        text_enc_2 = T5EncoderModel.from_pretrained(
+            self.model_name, subfolder="text_encoder_2", torch_dtype=dtype
+        ).to(self.device)
+        tok = CLIPTokenizer.from_pretrained(self.model_name, subfolder="tokenizer")
+        tok_2 = T5TokenizerFast.from_pretrained(self.model_name, subfolder="tokenizer_2")
         
-        print("Loading Transformer...")
+        with torch.no_grad():
+            clip_out = text_enc(tok([""], padding="max_length", max_length=77,
+                                   truncation=True, return_tensors="pt").input_ids.to(self.device))
+            t5_out = text_enc_2(tok_2([""], padding="max_length", max_length=512,
+                                     truncation=True, return_tensors="pt").input_ids.to(self.device))
+            self._cached_embeds = {
+                'pooled': clip_out.pooler_output.to(dtype),
+                'prompt': t5_out[0].to(dtype),
+                'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
+            }
+        
+        del text_enc, text_enc_2
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("Text", end=" ", flush=True)
+
+        # Load CLEAR Transformer
         self.transformer = FluxTransformer2DModel.from_pretrained(
-            model_name, subfolder="transformer", torch_dtype=dtype
+            self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
         self.transformer.requires_grad_(False)
-        
-        print("Loading ControlNet...")
+        print("Transformer", end=" ", flush=True)
+
+        # Load ControlNet
         self.controlnet = FluxControlNetModel.from_pretrained(
-            pretrained_controlnet, torch_dtype=dtype
+            "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
         ).to(self.device)
         self.controlnet.requires_grad_(False)
         
-        print("Loading Pixel Extractor...")
+        # 为 ControlNet 启用 Flash Attention
+        try:
+            import xformers
+            self.controlnet.enable_xformers_memory_efficient_attention()
+        except:
+            pass
+        print("ControlNet", end=" ", flush=True)
+        
+        # Load Pixel Extractor
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.requires_grad_(False)
+        print("PixelNet", end=" ", flush=True)
         
-        # 🌟 必须在 Load Checkpoint 之前，先把网络结构调整为 CLEAR 模式！
-        # 否则 checkpoint 里的 spatial_weight 找不到对应的层
-        if self.use_clear:
-            from attention_processor import LocalDownsampleFlexAttnProcessor, LocalFlexAttnProcessor
-            attn_processors = {}
-            for k in self.transformer.attn_processors.keys():
-                if self.down_factor > 1:
-                    attn_processors[k] = LocalDownsampleFlexAttnProcessor(down_factor=self.down_factor).to(self.device, dtype)
-                else:
-                    attn_processors[k] = LocalFlexAttnProcessor()
-            self.transformer.set_attn_processor(attn_processors)
-            print(f"[CLEAR] Initialized Transformer Attention Processors (down_factor={self.down_factor})")
-        
-        # Load checkpoint
-        print(f"Loading checkpoint: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        
-        ctrl_state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
-        self.controlnet.load_state_dict(ctrl_state)
-        
-        pixel_state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
-        self.pixel_extractor.load_state_dict(pixel_state)
-        
-        self.pixel_weight = ckpt.get('pixel_weight', 0.1)
-        print(f"Pixel weight: {self.pixel_weight}")
-        
-        self.controlnet.eval()
-        self.pixel_extractor.eval()
-
-    def enable_clear(self, height, width):
-        """为指定分辨率启用 CLEAR 的 Mask"""
-        if not self.use_clear:
-            return
-            
-        from attention_processor import init_local_downsample_mask_flex, init_local_mask_flex
-        
-        # 🌟 修复降维陷阱：这里必须是 // 16
-        patch_h = height // 16
-        patch_w = width // 16
-        text_length = 512
-        
-        print(f"[CLEAR] Initializing mask for {height}x{width} (patch grid: {patch_h}x{patch_w})...")
+        # 🌟 初始化 CLEAR
+        dummy_patch_size = 32  # 对应 512x512
+        device_str = str(self.device)
         
         if self.down_factor > 1:
             init_local_downsample_mask_flex(
-                height=patch_h,
-                width=patch_w,
-                text_length=text_length,
-                window_size=self.window_size,
-                down_factor=self.down_factor,
-                device=self.device
+                height=dummy_patch_size, width=dummy_patch_size, text_length=512,
+                window_size=self.window_size, down_factor=self.down_factor, device=device_str
+            )
+            attn_processors = {}
+            for k in self.transformer.attn_processors.keys():
+                attn_processors[k] = LocalDownsampleFlexAttnProcessor(
+                    down_factor=self.down_factor
+                ).to(self.device, dtype)
+        else:
+            init_local_mask_flex(
+                height=dummy_patch_size, width=dummy_patch_size, text_length=512,
+                window_size=self.window_size, device=device_str
+            )
+            attn_processors = {}
+            for k in self.transformer.attn_processors.keys():
+                attn_processors[k] = LocalFlexAttnProcessor()
+        
+        self.transformer.set_attn_processor(attn_processors)
+        print("CLEAR", end=" ", flush=True)
+        
+        # 🌟 加载 CLEAR 预训练权重
+        if os.path.exists(self.clear_ckpt):
+            clear_state_dict = load_file(self.clear_ckpt)
+            self.transformer.load_state_dict(clear_state_dict, strict=False)
+        else:
+            raise FileNotFoundError(f"CLEAR checkpoint not found: {self.clear_ckpt}")
+        
+        # 🌟 加载你训练的 checkpoint
+        if self.checkpoint_path and os.path.exists(self.checkpoint_path):
+            ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+            
+            # 读取 pixel_weight
+            if 'pixel_weight' in ckpt:
+                self.pixel_weight = ckpt['pixel_weight']
+            
+            # 加载 Pixel Extractor
+            if 'pixel_extractor' in ckpt:
+                state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
+                self.pixel_extractor.load_state_dict(state)
+            
+            # 加载 ControlNet
+            if 'controlnet' in ckpt:
+                state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
+                self.controlnet.load_state_dict(state)
+            
+            print(f"Checkpoint(epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f})")
+        else:
+            print("Done")
+        
+        self.controlnet.eval()
+        self.pixel_extractor.eval()
+        self.transformer.eval()
+        
+        # 设置初始 mask 尺寸（对应 512x512）
+        self._current_mask_size = (32, 32)
+        
+        print(f"[Eval] Ready. pixel_weight={self.pixel_weight}, GPU={torch.cuda.memory_allocated(self.device)/1e9:.1f}GB")
+    
+    def update_mask_for_size(self, height, width):
+        """根据图像尺寸更新 CLEAR mask"""
+        import attention_processor
+        from attention_processor import init_local_downsample_mask_flex, init_local_mask_flex
+        
+        patch_h = height // 16
+        patch_w = width // 16
+        
+        # 如果尺寸没变，不需要更新
+        if self._current_mask_size == (patch_h, patch_w):
+            return
+        
+        # 🌟 清除 lru_cache 强制重新生成
+        if hasattr(init_local_downsample_mask_flex, 'cache_clear'):
+            init_local_downsample_mask_flex.cache_clear()
+        if hasattr(init_local_mask_flex, 'cache_clear'):
+            init_local_mask_flex.cache_clear()
+        
+        # 🌟 重新初始化 mask（使用 "cuda"）
+        if self.down_factor > 1:
+            init_local_downsample_mask_flex(
+                height=patch_h, width=patch_w, text_length=512,
+                window_size=self.window_size, down_factor=self.down_factor, 
+                device="cuda"
             )
         else:
             init_local_mask_flex(
-                height=patch_h,
-                width=patch_w,
-                text_length=text_length,
-                window_size=self.window_size,
-                device=self.device
+                height=patch_h, width=patch_w, text_length=512,
+                window_size=self.window_size, device="cuda"
             )
-        print(f"[CLEAR] ✓ Mask Generated (window_size={self.window_size})")
+        
+        # 更新全局变量
+        attention_processor.HEIGHT = patch_h
+        attention_processor.WIDTH = patch_w
+        
+        self._current_mask_size = (patch_h, patch_w)
     
     def _pack(self, x):
         B, C, H, W = x.shape
@@ -330,6 +324,7 @@ class DualStreamFLUXSR_CLEAR:
         ids[..., 2] = torch.arange(w, device=device, dtype=dtype)[None, :]
         return ids.reshape(h*w, 3)
     
+    # 🌟 与训练代码完全一致的 encode/decode
     @torch.no_grad()
     def encode(self, img):
         return self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample() * self.vae.config.scaling_factor
@@ -338,7 +333,9 @@ class DualStreamFLUXSR_CLEAR:
     def decode(self, lat):
         return self.vae.decode(lat / self.vae.config.scaling_factor).sample
     
-    def forward_step(self, noisy, lr_lat, lr_pixel, t, guidance=3.5):
+    # 🌟 与训练代码完全一致的 forward
+    @torch.no_grad()
+    def forward(self, noisy, lr_lat, lr_pixel, t, guidance=3.5):
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
@@ -359,6 +356,7 @@ class DualStreamFLUXSR_CLEAR:
         packed_noisy = self._pack(noisy)
         packed_cond = self._pack(fused_cond)
         
+        # ControlNet
         ctrl_out = self.controlnet(
             hidden_states=packed_noisy,
             controlnet_cond=packed_cond,
@@ -374,6 +372,7 @@ class DualStreamFLUXSR_CLEAR:
         ctrl_block_samples = [x.to(dtype) for x in ctrl_out[0]] if ctrl_out[0] else None
         ctrl_single_samples = [x.to(dtype) for x in ctrl_out[1]] if ctrl_out[1] else None
         
+        # Transformer (with CLEAR attention)
         pred = self.transformer(
             hidden_states=packed_noisy,
             timestep=t,
@@ -389,84 +388,26 @@ class DualStreamFLUXSR_CLEAR:
         
         return self._unpack(pred, H, W)
     
+    # 🌟 与训练代码完全一致的 inference
     @torch.no_grad()
-    def inference(self, lr_img, target_size=None, num_steps=20, guidance=3.5):
-        """
-        SR inference with CLEAR acceleration
-        
-        Args:
-            lr_img: PIL Image (LR input)
-            target_size: (height, width) of output, None means 4x upscale
-            num_steps: number of denoising steps
-            guidance: classifier-free guidance scale
-        """
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5):
+        B = lr_lat.shape[0]
         dtype = torch.bfloat16
         
-        # Prepare input
-        lr_w, lr_h = lr_img.size
-        if target_size is None:
-            target_h, target_w = lr_h * 4, lr_w * 4
-        else:
-            target_h, target_w = target_size
+        lr_lat = lr_lat.to(dtype)
+        lr_pixel = lr_pixel.to(dtype)
         
-        # Ensure divisible by 32 (for VAE)
-        target_h = (target_h // 32) * 32
-        target_w = (target_w // 32) * 32
-        
-        # Enable CLEAR for this resolution
-        if self.use_clear:
-            self.enable_clear(target_h, target_w)
-        
-        # Upscale LR to target size
-        lr_up = lr_img.resize((target_w, target_h), Image.BICUBIC)
-        lr_t = torch.from_numpy(np.array(lr_up)).float().permute(2, 0, 1) / 127.5 - 1
-        lr_t = lr_t.unsqueeze(0).to(self.device, dtype=dtype)
-        
-        # Encode
-        lr_lat = self.encode(lr_t)
-        
-        # Flow matching inference
         lat = torch.randn_like(lr_lat)
         dt = 1.0 / num_steps
         
-        for i in tqdm(range(num_steps), desc="Denoising"):
+        for i in range(num_steps):
             t_val = 1.0 - i * dt
-            t = torch.full((1,), t_val, device=self.device, dtype=dtype)
-            v = self.forward_step(lat, lr_lat, lr_t, t, guidance)
+            # 🌟 关键：t 在 [0, 1] 范围，不乘 1000！
+            t = torch.full((B,), t_val, device=lr_lat.device, dtype=dtype)
+            v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
             lat = lat - dt * v
         
-        # Decode
-        sr = self.decode(lat)
-        
-        # To PIL
-        sr_np = ((sr[0].float().cpu().clamp(-1, 1) + 1) * 127.5).numpy().transpose(1, 2, 0).astype(np.uint8)
-        
-        return Image.fromarray(sr_np)
-
-
-# ============================================================================
-# Metrics
-# ============================================================================
-
-def calculate_psnr(img1, img2):
-    """Calculate PSNR between two PIL Images"""
-    arr1 = np.array(img1).astype(np.float64)
-    arr2 = np.array(img2).astype(np.float64)
-    mse = np.mean((arr1 - arr2) ** 2)
-    if mse == 0:
-        return float('inf')
-    return 20 * np.log10(255.0 / np.sqrt(mse))
-
-
-def calculate_ssim(img1, img2):
-    """Calculate SSIM between two PIL Images"""
-    try:
-        from skimage.metrics import structural_similarity as ssim
-        arr1 = np.array(img1)
-        arr2 = np.array(img2)
-        return ssim(arr1, arr2, channel_axis=2, data_range=255)
-    except:
-        return 0.0
+        return lat
 
 
 # ============================================================================
@@ -476,108 +417,216 @@ def calculate_ssim(img1, img2):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--input_dir', type=str, required=True)
-    parser.add_argument('--output_dir', type=str, required=True)
-    parser.add_argument('--gt_dir', type=str, default=None, help='Ground truth for metrics')
-    
+    parser.add_argument('--hr_dir', type=str, required=True)
+    parser.add_argument('--lr_dir', type=str, required=True)
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
-    parser.add_argument('--pretrained_controlnet', type=str, 
-                        default='jasperai/Flux.1-dev-Controlnet-Upscaler')
     
-    # CLEAR params
-    parser.add_argument('--window_size', type=int, default=16)
-    parser.add_argument('--no_clear', action='store_true')
-    
-    # Inference params
     parser.add_argument('--num_steps', type=int, default=20)
     parser.add_argument('--guidance', type=float, default=3.5)
-    parser.add_argument('--scale', type=int, default=4, help='Upscale factor')
+    parser.add_argument('--pixel_weight', type=float, default=None)
+    
+    # CLEAR 参数
+    parser.add_argument('--window_size', type=int, default=16)
+    parser.add_argument('--down_factor', type=int, default=4)
+    parser.add_argument('--clear_ckpt', type=str, default='ckpt/clear_local_16_down_4.safetensors')
+    
+    parser.add_argument('--output_base', type=str, default='./outputs')
+    parser.add_argument('--dataset', type=str, default=None)
+    parser.add_argument('--exp_name', type=str, default=None)
+    parser.add_argument('--save_images', action='store_true', default=True)
+    parser.add_argument('--save_comparisons', action='store_true', default=True)
+    
+    parser.add_argument('--device', type=str, default='cuda')
+    
+    # 🌟 新增：是否强制使用 512x512 (匹配训练)
+    parser.add_argument('--force_512', action='store_true', default=False,
+                        help='Force 512x512 evaluation to match training resolution')
     
     args = parser.parse_args()
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Auto-detect dataset
+    if args.dataset is None:
+        hr_lower = args.hr_dir.lower()
+        if 'urban' in hr_lower:
+            args.dataset = 'Urban100'
+        elif 'div2k' in hr_lower:
+            args.dataset = 'DIV2K'
+        elif 'set5' in hr_lower:
+            args.dataset = 'Set5'
+        elif 'set14' in hr_lower:
+            args.dataset = 'Set14'
+        elif 'bsd100' in hr_lower:
+            args.dataset = 'BSD100'
+        elif 'manga' in hr_lower:
+            args.dataset = 'Manga109'
+        else:
+            args.dataset = 'Unknown'
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_name = args.exp_name or f"{ts}_clear_w{args.window_size}_d{args.down_factor}_{args.num_steps}step"
     
-    print("=" * 60)
-    print("Dual-Stream FLUX SR Evaluation with CLEAR")
-    print("=" * 60)
-    print(f"CLEAR: {'Disabled' if args.no_clear else f'Enabled (r={args.window_size})'}")
+    output_dir = os.path.join(args.output_base, args.dataset, 'CLEARControl', exp_name)
+    os.makedirs(output_dir, exist_ok=True)
+    if args.save_images:
+        os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
+    if args.save_comparisons:
+        os.makedirs(os.path.join(output_dir, 'comparisons'), exist_ok=True)
+    
+    print("=" * 70)
+    print("Dual-Stream FLUX SR Evaluation (CLEAR)")
+    print("=" * 70)
     print(f"Checkpoint: {args.checkpoint}")
-    print(f"Input: {args.input_dir}")
-    print(f"Output: {args.output_dir}")
-    print("=" * 60)
+    print(f"Dataset: {args.dataset}")
+    print(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}")
+    print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
+    if args.force_512:
+        print("⚠️  Force 512x512 mode enabled")
+    print(f"Output: {output_dir}")
+    print("=" * 70)
     
-    # Load model
-    system = DualStreamFLUXSR_CLEAR(
-        model_name=args.model_name,
-        device=device,
-        pretrained_controlnet=args.pretrained_controlnet,
-        checkpoint_path=args.checkpoint,
+    evaluator = DualStreamEvaluator(
+        args.model_name, device, args.checkpoint,
+        pixel_weight=args.pixel_weight or 0.1,
         window_size=args.window_size,
-        use_clear=not args.no_clear,
-        down_factor=4, # 🌟 填入你训练时使用的参数
+        down_factor=args.down_factor,
+        clear_ckpt=args.clear_ckpt
     )
+    evaluator.load()
     
-    # Get input images
-    image_files = sorted([f for f in os.listdir(args.input_dir) 
-                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    if args.pixel_weight is not None:
+        evaluator.pixel_weight = args.pixel_weight
+        print(f"[Eval] Override pixel_weight: {args.pixel_weight}")
     
-    print(f"\nProcessing {len(image_files)} images...\n")
+    lpips_fn = None
+    if LPIPS_AVAILABLE:
+        lpips_fn = lpips.LPIPS(net='alex').to(device)
+        lpips_fn.eval()
     
-    psnr_list = []
-    ssim_list = []
-    time_list = []
+    hr_files = sorted([f for f in os.listdir(args.hr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    lr_files = sorted([f for f in os.listdir(args.lr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    assert len(hr_files) == len(lr_files)
     
-    for img_file in tqdm(image_files):
-        lr_path = os.path.join(args.input_dir, img_file)
-        lr_img = Image.open(lr_path).convert('RGB')
+    print(f"\nEvaluating {len(hr_files)} images...\n")
+    
+    psnr_list, ssim_list, lpips_list = [], [], []
+    psnr_bic_list, ssim_bic_list, lpips_bic_list = [], [], []
+    filenames = []
+    
+    for hf, lf in tqdm(zip(hr_files, lr_files), total=len(hr_files), desc="Evaluating"):
+        base_name = os.path.splitext(hf)[0]
+        filenames.append(base_name)
         
-        # Calculate target size
-        lr_w, lr_h = lr_img.size
-        target_h = (lr_h * args.scale // 32) * 32
-        target_w = (lr_w * args.scale // 32) * 32
+        hr_img = Image.open(os.path.join(args.hr_dir, hf)).convert('RGB')
+        lr_img = Image.open(os.path.join(args.lr_dir, lf)).convert('RGB')
         
-        # Inference
-        start_time = time.time()
-        sr_img = system.inference(
-            lr_img, 
-            target_size=(target_h, target_w),
-            num_steps=args.num_steps,
-            guidance=args.guidance
-        )
-        elapsed = time.time() - start_time
-        time_list.append(elapsed)
+        if args.force_512:
+            W, H = 512, 512
+            hr_img = hr_img.resize((W, H), Image.BICUBIC)
+            lr_img = lr_img.resize((W // 4, H // 4), Image.BICUBIC)
+        else:
+            orig_W, orig_H = hr_img.size
+            W = orig_W - (orig_W % 64)
+            H = orig_H - (orig_H % 64)
+            hr_img = hr_img.crop((0, 0, W, H))
+            lr_img = lr_img.crop((0, 0, W // 4, H // 4))
         
-        # Save
-        output_path = os.path.join(args.output_dir, img_file)
-        sr_img.save(output_path)
+        hr_np = np.array(hr_img)
         
-        # Metrics if GT available
-        if args.gt_dir:
-            gt_path = os.path.join(args.gt_dir, img_file)
-            if os.path.exists(gt_path):
-                gt_img = Image.open(gt_path).convert('RGB')
-                gt_img = gt_img.resize((target_w, target_h), Image.BICUBIC)
-                
-                psnr = calculate_psnr(sr_img, gt_img)
-                ssim = calculate_ssim(sr_img, gt_img)
-                psnr_list.append(psnr)
-                ssim_list.append(ssim)
+        lr_bicubic = lr_img.resize((W, H), Image.BICUBIC)
+        lr_bicubic_np = np.array(lr_bicubic)
+        
+        lr_t = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+        lr_t = lr_t.to(device).to(torch.bfloat16)
+        
+        # 更新 CLEAR mask
+        evaluator.update_mask_for_size(H, W)
+        
+        # 推理
+        lr_lat = evaluator.encode(lr_t)
+        sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=args.num_steps, guidance=args.guidance)
+        sr_t = evaluator.decode(sr_lat)
+        
+        sr_np = ((sr_t[0].float().cpu().clamp(-1, 1) + 1) * 127.5).numpy().transpose(1, 2, 0).astype(np.uint8)
+        
+        # 计算指标
+        psnr_val = calculate_psnr(sr_np, hr_np)
+        ssim_val = calculate_ssim(sr_np, hr_np)
+        psnr_list.append(psnr_val)
+        ssim_list.append(ssim_val)
+        
+        psnr_bic = calculate_psnr(lr_bicubic_np, hr_np)
+        ssim_bic = calculate_ssim(lr_bicubic_np, hr_np)
+        psnr_bic_list.append(psnr_bic)
+        ssim_bic_list.append(ssim_bic)
+        
+        if lpips_fn:
+            hr_t = torch.from_numpy(hr_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+            sr_t_lpips = torch.from_numpy(sr_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+            lr_t_lpips = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+            lpips_val = lpips_fn(sr_t_lpips.to(device), hr_t.to(device)).item()
+            lpips_bic = lpips_fn(lr_t_lpips.to(device), hr_t.to(device)).item()
+            lpips_list.append(lpips_val)
+            lpips_bic_list.append(lpips_bic)
+        
+        if args.save_images:
+            Image.fromarray(sr_np).save(os.path.join(output_dir, 'predictions', f'{base_name}.png'))
+        
+        if args.save_comparisons:
+            comp = Image.new('RGB', (W * 4, H))
+            comp.paste(lr_img.resize((W, H), Image.NEAREST), (0, 0))
+            comp.paste(lr_bicubic, (W, 0))
+            comp.paste(Image.fromarray(sr_np), (W * 2, 0))
+            comp.paste(hr_img, (W * 3, 0))
+            comp.save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
+        
+        torch.cuda.empty_cache()
     
-    # Summary
-    print("\n" + "=" * 60)
-    print("Results Summary")
-    print("=" * 60)
-    print(f"Total images: {len(image_files)}")
-    print(f"Avg time per image: {np.mean(time_list):.2f}s")
+    # 汇总
+    avg_psnr = np.mean(psnr_list)
+    avg_ssim = np.mean(ssim_list)
+    avg_psnr_bic = np.mean(psnr_bic_list)
+    avg_ssim_bic = np.mean(ssim_bic_list)
+    avg_lpips = np.mean(lpips_list) if lpips_list else 0
+    avg_lpips_bic = np.mean(lpips_bic_list) if lpips_bic_list else 0
     
-    if psnr_list:
-        print(f"Avg PSNR: {np.mean(psnr_list):.2f} dB")
-        print(f"Avg SSIM: {np.mean(ssim_list):.4f}")
+    print("\n" + "=" * 70)
+    print("Results")
+    print("=" * 70)
+    print(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}")
+    print(f"Pixel Weight: {evaluator.pixel_weight}")
+    if LPIPS_AVAILABLE:
+        print(f"Bicubic:      PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
+        print(f"CLEARControl: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
+        print(f"Δ:            {avg_psnr - avg_psnr_bic:+.4f}, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
+    else:
+        print(f"Bicubic:      PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}")
+        print(f"CLEARControl: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}")
+    print("=" * 70)
     
-    print(f"Output saved to: {args.output_dir}")
-    print("=" * 60)
+    # 保存结果
+    with open(os.path.join(output_dir, 'results.txt'), 'w') as f:
+        f.write("Dual-Stream FLUX SR (CLEARControl)\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Checkpoint: {args.checkpoint}\n")
+        f.write(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}\n")
+        f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
+        f.write(f"Dataset: {args.dataset}\n")
+        f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
+        f.write(f"Force 512: {args.force_512}\n")
+        f.write("\nSummary:\n")
+        if LPIPS_AVAILABLE:
+            f.write(f"Bicubic:      PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}\n")
+            f.write(f"CLEARControl: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
+        else:
+            f.write(f"Bicubic:      PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}\n")
+            f.write(f"CLEARControl: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}\n")
+        f.write("\nPer-image:\n")
+        for i, fname in enumerate(filenames):
+            f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (Δ{psnr_list[i]-psnr_bic_list[i]:+.2f})\n")
+    
+    print(f"\n✅ Results saved: {output_dir}")
 
 
 if __name__ == '__main__':

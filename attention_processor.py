@@ -1,9 +1,56 @@
+import os
+import sys
+import io
+
+# 🌟 禁用 Triton autotune 输出（必须在 import torch 之前）
+os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+os.environ["TORCH_LOGS"] = "-all"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+
+# 🌟 禁用 torch.compile 的 autotune 日志
+try:
+    import torch._inductor.config as inductor_config
+    inductor_config.verbose_progress = False
+    inductor_config.benchmark_kernel = False
+except:
+    pass
+
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-create_block_mask = torch.compile(create_block_mask)
+
+# 🌟 使用 suppress_triton_warnings 模式编译
+import functools
+@functools.lru_cache(maxsize=None)
+def _get_compiled_create_block_mask():
+    return torch.compile(create_block_mask)
+
+create_block_mask = _get_compiled_create_block_mask()
+
+# 🌟 全局标志：是否抑制 autotune 输出
+_SUPPRESS_AUTOTUNE = True
+_autotune_suppressed_ids = set()  # 已经 warmup 过的 compiled 函数
+
+class _AutotuneSuppressor:
+    """在第一次调用 compiled 函数时抑制 autotune 输出"""
+    def __init__(self):
+        self._old_stdout = None
+        self._old_stderr = None
+    
+    def __enter__(self):
+        if _SUPPRESS_AUTOTUNE:
+            self._old_stdout = sys.stdout
+            self._old_stderr = sys.stderr
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+        return self
+    
+    def __exit__(self, *args):
+        if _SUPPRESS_AUTOTUNE and self._old_stdout is not None:
+            sys.stdout = self._old_stdout
+            sys.stderr = self._old_stderr
 from diffusers.models.attention_processor import Attention
 from typing import Optional
 from functools import partial, lru_cache
@@ -115,6 +162,11 @@ class FluxAttnProcessor2_0:
 
 @lru_cache
 def init_local_downsample_mask_flex(height, width, text_length, window_size, down_factor, device):
+    # 🌟 强制使用 CUDA
+    if isinstance(device, str):
+        device = "cuda" if "cuda" in device else device
+    else:
+        device = "cuda" if device.type == "cuda" else str(device)
     
     def local_dwonsample_mask(b, h, q_idx, kv_idx):
         q_y = (q_idx - text_length) // width
@@ -146,12 +198,13 @@ class LocalDownsampleFlexAttnProcessor(nn.Module):
     
     def __init__(self, down_factor=4, distill=False):
         super().__init__()
-        assert BLOCK_MASK is not None
-        self.flex_attn = partial(flex_attention, block_mask=BLOCK_MASK)
-        self.flex_attn = torch.compile(self.flex_attn, dynamic=False)
+        # 🌟 修复：不在 __init__ 绑定 BLOCK_MASK，而是在 __call__ 时动态获取
         self.down_factor = down_factor
         self.spatial_weight = nn.Parameter(torch.ones(1, 1, 1, down_factor, 1, down_factor, 1) / (down_factor * down_factor))
         self.distill = distill
+        self._compiled_flex_attn = None
+        self._compiled_mask_id = None  # 用于检测 BLOCK_MASK 是否变化
+        self._first_run = True  # 🌟 标记第一次运行
         
     def __call__(
         self,
@@ -162,6 +215,19 @@ class LocalDownsampleFlexAttnProcessor(nn.Module):
         image_rotary_emb: Optional[torch.Tensor] = None,
         proportional_attention=False
     ) -> torch.FloatTensor:
+        # 🌟 动态获取 BLOCK_MASK 并按需 compile
+        global BLOCK_MASK, HEIGHT, WIDTH
+        current_mask_id = id(BLOCK_MASK)
+        need_recompile = self._compiled_flex_attn is None or self._compiled_mask_id != current_mask_id
+        
+        if need_recompile:
+            self._compiled_flex_attn = torch.compile(
+                partial(flex_attention, block_mask=BLOCK_MASK), 
+                dynamic=False
+            )
+            self._compiled_mask_id = current_mask_id
+            self._first_run = True  # 新编译后需要重新 warmup
+        
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
         # `sample` projections.
@@ -223,7 +289,13 @@ class LocalDownsampleFlexAttnProcessor(nn.Module):
         value_downsample = (value[:, :, 512:].unflatten(2, (HEIGHT // self.down_factor, self.down_factor, 
                                                             WIDTH // self.down_factor, self.down_factor)) * self.spatial_weight).sum(dim=(3, 5)).flatten(2, 3)
 
-        hidden_states = self.flex_attn(query, torch.cat([key, key_downsample], dim=2), torch.cat([value, value_downsample], dim=2), scale=attention_scale)
+        # 🌟 第一次调用时抑制 autotune 输出
+        if self._first_run:
+            with _AutotuneSuppressor():
+                hidden_states = self._compiled_flex_attn(query, torch.cat([key, key_downsample], dim=2), torch.cat([value, value_downsample], dim=2), scale=attention_scale)
+            self._first_run = False
+        else:
+            hidden_states = self._compiled_flex_attn(query, torch.cat([key, key_downsample], dim=2), torch.cat([value, value_downsample], dim=2), scale=attention_scale)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -250,6 +322,11 @@ class LocalDownsampleFlexAttnProcessor(nn.Module):
 
 @lru_cache
 def init_local_mask_flex(height, width, text_length, window_size, device):
+    # 🌟 强制使用 CUDA
+    if isinstance(device, str):
+        device = "cuda" if "cuda" in device else device
+    else:
+        device = "cuda" if device.type == "cuda" else str(device)
     
     def local_mask(b, h, q_idx, kv_idx):
         q_y = (q_idx - text_length) // width
@@ -271,10 +348,11 @@ class LocalFlexAttnProcessor:
     """Attention processor used typically in processing the SD3-like self-attention projections."""
 
     def __init__(self, distill=False):
-        super().__init__()
-        self.flex_attn = partial(flex_attention, block_mask=BLOCK_MASK)
-        self.flex_attn = torch.compile(self.flex_attn, dynamic=False)
+        # 🌟 修复：不在 __init__ 绑定 BLOCK_MASK
         self.distill = distill
+        self._compiled_flex_attn = None
+        self._compiled_mask_id = None
+        self._first_run = True  # 🌟 标记第一次运行
 
     def __call__(
         self,
@@ -285,6 +363,17 @@ class LocalFlexAttnProcessor:
         image_rotary_emb: Optional[torch.Tensor] = None,
         proportional_attention=False
     ) -> torch.FloatTensor:
+        # 🌟 动态获取 BLOCK_MASK 并按需 compile
+        global BLOCK_MASK
+        current_mask_id = id(BLOCK_MASK)
+        if self._compiled_flex_attn is None or self._compiled_mask_id != current_mask_id:
+            self._compiled_flex_attn = torch.compile(
+                partial(flex_attention, block_mask=BLOCK_MASK), 
+                dynamic=False
+            )
+            self._compiled_mask_id = current_mask_id
+            self._first_run = True  # 新编译后需要重新 warmup
+            
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
         # `sample` projections.
@@ -341,7 +430,13 @@ class LocalFlexAttnProcessor:
         else:
             attention_scale = math.sqrt(1 / head_dim)
 
-        hidden_states = self.flex_attn(query, key, value, scale=attention_scale)
+        # 🌟 第一次调用时抑制 autotune 输出
+        if self._first_run:
+            with _AutotuneSuppressor():
+                hidden_states = self._compiled_flex_attn(query, key, value, scale=attention_scale)
+            self._first_run = False
+        else:
+            hidden_states = self._compiled_flex_attn(query, key, value, scale=attention_scale)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 

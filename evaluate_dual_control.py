@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-Dual-Stream FLUX SR ControlNet Evaluation
+Dual-Stream FLUX SR Evaluation - Simplified Version
 
-与 train_dual_control.py 完全匹配的评估脚本
+与 train_dual_control_simple.py 完全匹配
 
 Usage:
-    python evaluate_dual_control.py \
-        --checkpoint checkpoints/dual_control/xxx/best_model.pt \
+    python evaluate_dual_control_simple.py \
+        --checkpoint checkpoints/dual_simple/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --tile_size 1024 --overlap 128
@@ -37,21 +37,10 @@ except ImportError:
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
-    """
-    从原始像素空间提取高频特征，并映射到 Latent 空间维度。
-    使用 Zero Conv 确保初始化时不破坏预训练 ControlNet。
-    使用 GroupNorm 稳定训练。
-    
-    Input: RGB image [B, 3, H, W] (H, W = 512)
-    Output: Latent-space features [B, 16, H/8, W/8] (64x64)
-    """
     def __init__(self, latent_channels=16):
         super().__init__()
         
-        # 编码器：3 通道 RGB → 16 通道 Latent 维度，stride=8 匹配空间分辨率
-        # 🌟 加入 GroupNorm 稳定训练
         self.encoder = nn.Sequential(
-            # 512 → 256
             nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 32),
             nn.SiLU(),
@@ -59,7 +48,6 @@ class PixelFeatureExtractor(nn.Module):
             nn.GroupNorm(8, 32),
             nn.SiLU(),
             
-            # 256 → 128
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
@@ -67,7 +55,6 @@ class PixelFeatureExtractor(nn.Module):
             nn.GroupNorm(8, 64),
             nn.SiLU(),
             
-            # 128 → 64
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 128),
             nn.SiLU(),
@@ -76,7 +63,6 @@ class PixelFeatureExtractor(nn.Module):
             nn.SiLU(),
         )
         
-        # 🌟 Zero Conv: 初始化权重为 0，确保初始时 Pixel 特征全为 0
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
         nn.init.zeros_(self.zero_conv.weight)
         nn.init.zeros_(self.zero_conv.bias)
@@ -91,7 +77,6 @@ class PixelFeatureExtractor(nn.Module):
 # ============================================================================
 
 def calculate_psnr(img1, img2):
-    """Calculate PSNR between two numpy arrays [0, 255]"""
     mse = np.mean((img1.astype(np.float64) - img2.astype(np.float64)) ** 2)
     if mse == 0:
         return float('inf')
@@ -99,7 +84,6 @@ def calculate_psnr(img1, img2):
 
 
 def calculate_ssim(img1, img2):
-    """Calculate SSIM between two numpy arrays"""
     C1 = (0.01 * 255) ** 2
     C2 = (0.03 * 255) ** 2
     img1 = img1.astype(np.float64)
@@ -113,14 +97,15 @@ def calculate_ssim(img1, img2):
 
 
 # ============================================================================
-# Dual-Stream Evaluator
+# Evaluator
 # ============================================================================
 
 class DualStreamEvaluator:
-    def __init__(self, model_name, device, checkpoint_path=None):
+    def __init__(self, model_name, device, checkpoint_path=None, pixel_weight=0.1):
         self.model_name = model_name
         self.device = device
         self.checkpoint_path = checkpoint_path
+        self.pixel_weight = pixel_weight  # 🌟 可从 checkpoint 加载
         
         self.vae = None
         self.transformer = None
@@ -193,6 +178,11 @@ class DualStreamEvaluator:
             ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
             self.ckpt_info = ckpt
             
+            # 🌟 从 checkpoint 加载 pixel_weight
+            if 'pixel_weight' in ckpt:
+                self.pixel_weight = ckpt['pixel_weight']
+                print(f"[Eval] Loaded pixel_weight: {self.pixel_weight}")
+            
             # Load Pixel Extractor
             if 'pixel_extractor' in ckpt:
                 raw_state = ckpt['pixel_extractor']
@@ -207,7 +197,7 @@ class DualStreamEvaluator:
                 self.controlnet.load_state_dict(clean_state)
                 print("[Eval] ✓ Loaded ControlNet")
             
-            print(f"[Eval] Checkpoint info: epoch={ckpt.get('epoch', '?')}, loss={ckpt.get('loss', '?'):.4f}, psnr={ckpt.get('psnr', '?')}")
+            print(f"[Eval] Checkpoint info: epoch={ckpt.get('epoch', '?')}, loss={ckpt.get('loss', 0):.4f}, psnr={ckpt.get('psnr', 0):.2f}")
         else:
             print("[Eval] ⚠ No checkpoint provided, using pretrained weights only")
         
@@ -216,6 +206,7 @@ class DualStreamEvaluator:
         self.controlnet.eval()
         self.pixel_extractor.eval()
         
+        print(f"[Eval] Pixel weight: {self.pixel_weight}")
         print(f"[Eval] Ready. GPU: {torch.cuda.memory_allocated(self.device)/1e9:.2f} GB")
     
     def _pack(self, x):
@@ -258,15 +249,12 @@ class DualStreamEvaluator:
         txt_ids = self._cached_embeds['text_ids']
         img_ids = self._img_ids(H, W, device, dtype)
         
-        # 🌟 删除了在这里重复计算 pixel_feat 的代码
-        
         packed_noisy = self._pack(noisy)
-        # 🌟 packed_cond 直接从参数传进来，无需再打包
         
         # ControlNet
         ctrl_kwargs = {
             'hidden_states': packed_noisy,
-            'controlnet_cond': packed_cond, # 🌟 直接使用
+            'controlnet_cond': packed_cond,
             'timestep': t,
             'encoder_hidden_states': prompt,
             'pooled_projections': pooled,
@@ -278,7 +266,6 @@ class DualStreamEvaluator:
         
         ctrl_out = self.controlnet(**ctrl_kwargs)
         
-        # 确保 ControlNet 输出是 bfloat16
         ctrl_block_samples = [x.to(dtype) for x in ctrl_out[0]] if ctrl_out[0] is not None else None
         ctrl_single_samples = [x.to(dtype) for x in ctrl_out[1]] if ctrl_out[1] is not None else None
         
@@ -301,31 +288,39 @@ class DualStreamEvaluator:
     
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5):
-        """🌟 MeanFlow 推理：从 lr_lat + sigma*noise 出发"""
+        """
+        🌟 Standard Flow Matching 推理：从纯噪声出发
+        """
         B = lr_lat.shape[0]
         dtype = torch.bfloat16
         
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # 🌟 核心优化：在 20 步循环前，一次性计算完条件特征并打包！
+        # 🌟 预计算 fused condition
         pixel_feat = self.pixel_extractor(lr_pixel).to(dtype)
-        fused_cond = (lr_lat + pixel_feat).to(dtype)
+        fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
         packed_cond = self._pack(fused_cond)
         
-        # MeanFlow: 从 LR latent 出发
-        sigma = 0.1
-        noise = torch.randn_like(lr_lat)
-        lat = lr_lat + sigma * noise
+        # 🌟 Standard: 从纯噪声出发
+        lat = torch.randn_like(lr_lat)
         
         dt = 1.0 / num_steps
         
         for i in range(num_steps):
             t_val = 1.0 - i * dt
             t = torch.full((B,), t_val, device=lr_lat.device, dtype=dtype)
-            # 🌟 直接传入预先计算好的 packed_cond
+            
+            # 模型预测使用 bfloat16
             v = self.forward(lat, packed_cond, t, guidance)
-            lat = lat - dt * v
+            
+            # 🌟 核心改进：在进行 ODE 步进更新时，转换为 float32 保证数值绝对精准
+            lat_f32 = lat.float()
+            v_f32 = v.float()
+            lat_f32 = lat_f32 - dt * v_f32
+            
+            # 更新完再转回 bfloat16 给下一步使用
+            lat = lat_f32.to(dtype)
         
         return lat
 
@@ -337,7 +332,6 @@ class DualStreamEvaluator:
 @torch.no_grad()
 def run_sr_tiled(evaluator, lr_tensor, device, num_steps=20, guidance=3.5,
                  tile_size=1024, overlap=128, blend_mode='gaussian'):
-    """Tiled inference for large images"""
     _, _, H, W = lr_tensor.shape
     
     # Small image: direct inference
@@ -387,20 +381,17 @@ def run_sr_tiled(evaluator, lr_tensor, device, num_steps=20, guidance=3.5,
             tile = lr_tensor[:, :, h_start:h_end, w_start:w_end]
             th, tw = tile.shape[2], tile.shape[3]
             
-            # Pad if needed
             if th < tile_size or tw < tile_size:
                 tile_padded = F.pad(tile, (0, tile_size - tw, 0, tile_size - th), mode='reflect')
             else:
                 tile_padded = tile
             
-            # Inference
             lr_lat = evaluator.encode(tile_padded)
             sr_lat = evaluator.inference(lr_lat, tile_padded, num_steps, guidance)
             tile_out_padded = evaluator.decode(sr_lat)
             
             tile_out = tile_out_padded[:, :, :th, :tw]
             
-            # Blending weights
             if blend_mode == 'gaussian':
                 tile_weight = gaussian[:, :, :th, :tw]
             else:
@@ -430,6 +421,10 @@ def main():
     parser.add_argument('--tile_size', type=int, default=1024)
     parser.add_argument('--overlap', type=int, default=128)
     parser.add_argument('--blend_mode', type=str, default='gaussian')
+    
+    # 🌟 可手动覆盖 pixel_weight
+    parser.add_argument('--pixel_weight', type=float, default=None,
+                        help='Override pixel weight (default: load from checkpoint)')
     
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
@@ -465,18 +460,21 @@ def main():
         exp_name = args.exp_name
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_name = f"{ts}_dual_{args.num_steps}step"
+        exp_name = f"{ts}_dual_simple_{args.num_steps}step"
     
     # Output directory
-    output_dir = os.path.join(args.output_base, args.dataset, 'DualControl', exp_name)
+    output_dir = os.path.join(args.output_base, args.dataset, 'DualSimple', exp_name)
     os.makedirs(output_dir, exist_ok=True)
     if args.save_images:
         os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
     if args.save_comparisons:
         os.makedirs(os.path.join(output_dir, 'comparisons'), exist_ok=True)
     
+    # 初始 pixel_weight（可能被 checkpoint 覆盖）
+    initial_pixel_weight = args.pixel_weight if args.pixel_weight is not None else 0.1
+    
     print("=" * 70)
-    print("Dual-Stream FLUX SR ControlNet Evaluation")
+    print("Dual-Stream FLUX SR Evaluation (Simplified)")
     print("=" * 70)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset: {args.dataset}")
@@ -486,8 +484,13 @@ def main():
     print("=" * 70)
     
     # Load model
-    evaluator = DualStreamEvaluator(args.model_name, device, args.checkpoint)
+    evaluator = DualStreamEvaluator(args.model_name, device, args.checkpoint, initial_pixel_weight)
     evaluator.load()
+    
+    # 🌟 如果命令行指定了 pixel_weight，覆盖 checkpoint 中的值
+    if args.pixel_weight is not None:
+        evaluator.pixel_weight = args.pixel_weight
+        print(f"[Eval] Overriding pixel_weight to: {args.pixel_weight}")
     
     # Load LPIPS
     lpips_fn = None
@@ -517,15 +520,12 @@ def main():
         hr_np = np.array(hr_img)
         H, W = hr_np.shape[0], hr_np.shape[1]
         
-        # Bicubic upscale
         lr_bicubic = lr_img.resize((W, H), Image.BICUBIC)
         lr_bicubic_np = np.array(lr_bicubic)
         
-        # To tensor
         lr_t = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
         lr_t = lr_t.to(device).to(torch.bfloat16)
         
-        # Tiled inference
         sr_t = run_sr_tiled(
             evaluator, lr_t, device,
             num_steps=args.num_steps,
@@ -543,7 +543,7 @@ def main():
         psnr_list.append(psnr_val)
         ssim_list.append(ssim_val)
         
-        # Metrics - Bicubic baseline
+        # Metrics - Bicubic
         psnr_bic = calculate_psnr(lr_bicubic_np, hr_np)
         ssim_bic = calculate_ssim(lr_bicubic_np, hr_np)
         psnr_bic_list.append(psnr_bic)
@@ -572,9 +572,9 @@ def main():
             comp.paste(Image.fromarray(sr_np), (W * 2, 0))
             comp.paste(hr_img, (W * 3, 0))
             comp.save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
-        # 🌟 核心防护：每跑完一张图，强制清空缓存的显存碎片，为下一张图留出连续显存
+        
         torch.cuda.empty_cache()
-
+    
     # Results
     avg_psnr = np.mean(psnr_list)
     avg_ssim = np.mean(ssim_list)
@@ -586,37 +586,38 @@ def main():
     print("\n" + "=" * 70)
     print("Results")
     print("=" * 70)
+    print(f"Pixel Weight: {evaluator.pixel_weight}")
     if LPIPS_AVAILABLE:
         print(f"Bicubic:     PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
-        print(f"Dual-Stream: PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
+        print(f"Dual-Simple: PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
         print(f"Δ:           {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
     else:
         print(f"Bicubic:     PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}")
-        print(f"Dual-Stream: PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}")
+        print(f"Dual-Simple: PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}")
     print("=" * 70)
     
     # Save results
     results_path = os.path.join(output_dir, 'results.txt')
     with open(results_path, 'w') as f:
-        f.write("Dual-Stream FLUX SR ControlNet Evaluation Results\n")
+        f.write("Dual-Stream FLUX SR Evaluation (Simplified)\n")
         f.write("=" * 60 + "\n")
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
+        f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
         f.write(f"Tile: {args.tile_size}, Overlap: {args.overlap}\n")
-        f.write("\n")
-        f.write("=" * 60 + "\n")
+        f.write("\n" + "=" * 60 + "\n")
         f.write("Summary:\n")
         f.write("=" * 60 + "\n")
         if LPIPS_AVAILABLE:
             f.write(f"Bicubic:     PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}\n")
-            f.write(f"Dual-Stream: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
+            f.write(f"Dual-Simple: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
             f.write(f"Δ:           {avg_psnr - avg_psnr_bic:+.4f}, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}\n")
         else:
             f.write(f"Bicubic:     PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}\n")
-            f.write(f"Dual-Stream: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}\n")
+            f.write(f"Dual-Simple: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}\n")
         f.write("\n" + "=" * 60 + "\n")
         f.write("Per-image results:\n")
         f.write("=" * 60 + "\n")
