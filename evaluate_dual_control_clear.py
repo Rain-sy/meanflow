@@ -6,6 +6,7 @@ Dual-Stream FLUX SR Evaluation with CLEAR Acceleration
 import os
 import sys
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # 🌟 必须在导入 torch 之前设置这些环境变量
 os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
 os.environ["TORCH_LOGS"] = "-all"
@@ -146,12 +147,14 @@ class DualStreamEvaluator:
         dtype = torch.bfloat16
         print(f"[Eval] Loading models (CLEAR: w={self.window_size}, d={self.down_factor})...", end=" ", flush=True)
         
-        # Load VAE
+        # Load VAE (先加载到 CPU，用时再搬到 GPU，节省显存)
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
-        ).to(self.device)
+        )
         self.vae.requires_grad_(False)
-        print("VAE", end=" ", flush=True)
+        self.vae.enable_tiling()  # 🌟 极大降低高分辨率 Decode 时的显存峰值
+        self.vae.to("cpu")  # 🌟 平时放 CPU，用时再搬
+        print("VAE(tiled)", end=" ", flush=True)
         
         # Cache text embeddings (与训练完全一致)
         text_enc = CLIPTextModel.from_pretrained(
@@ -209,27 +212,45 @@ class DualStreamEvaluator:
         dummy_patch_size = 32  # 对应 512x512
         device_str = str(self.device)
         
+        # 🌟 初始化 CLEAR mask
+        dummy_patch_size = 32
+        device_str = str(self.device)
+        
         if self.down_factor > 1:
             init_local_downsample_mask_flex(
                 height=dummy_patch_size, width=dummy_patch_size, text_length=512,
                 window_size=self.window_size, down_factor=self.down_factor, device=device_str
             )
-            attn_processors = {}
-            for k in self.transformer.attn_processors.keys():
-                attn_processors[k] = LocalDownsampleFlexAttnProcessor(
-                    down_factor=self.down_factor
-                ).to(self.device, dtype)
         else:
             init_local_mask_flex(
                 height=dummy_patch_size, width=dummy_patch_size, text_length=512,
                 window_size=self.window_size, device=device_str
             )
-            attn_processors = {}
-            for k in self.transformer.attn_processors.keys():
-                attn_processors[k] = LocalFlexAttnProcessor()
         
-        self.transformer.set_attn_processor(attn_processors)
-        print("CLEAR", end=" ", flush=True)
+        # 🌟 修复：精准投递 CLEAR，只对双流模块使用，单流模块保留原生！
+        dtype = torch.bfloat16
+        original_processors = self.transformer.attn_processors
+        trans_attn_processors = {}
+        
+        for k, proc in original_processors.items():
+            if k.startswith("transformer_blocks"):
+                # 只有双流模块换上 CLEAR（这些有预训练权重）
+                if self.down_factor > 1:
+                    trans_attn_processors[k] = LocalDownsampleFlexAttnProcessor(
+                        down_factor=self.down_factor
+                    ).to(self.device, dtype)
+                else:
+                    trans_attn_processors[k] = LocalFlexAttnProcessor()
+            else:
+                # 🌟 极其重要：single_transformer_blocks 必须保留原生处理器！
+                trans_attn_processors[k] = proc
+        
+        self.transformer.set_attn_processor(trans_attn_processors)
+        
+        # 统计
+        clear_count = sum(1 for k in trans_attn_processors if k.startswith("transformer_blocks"))
+        native_count = len(trans_attn_processors) - clear_count
+        print(f"CLEAR({clear_count}) Native({native_count})", end=" ", flush=True)
         
         # 🌟 加载 CLEAR 预训练权重
         if os.path.exists(self.clear_ckpt):
@@ -280,6 +301,15 @@ class DualStreamEvaluator:
         # 如果尺寸没变，不需要更新
         if self._current_mask_size == (patch_h, patch_w):
             return
+
+        # 🌟 致命修复：彻底清空 PyTorch Dynamo 的编译内核缓存！
+        import torch._dynamo
+        torch._dynamo.reset()
+        
+        # 释放上一张图的旧 Mask 物理内存
+        attention_processor.BLOCK_MASK = None
+        torch.cuda.empty_cache()
+        gc.collect()
         
         # 🌟 清除 lru_cache 强制重新生成
         if hasattr(init_local_downsample_mask_flex, 'cache_clear'):
@@ -327,11 +357,23 @@ class DualStreamEvaluator:
     # 🌟 与训练代码完全一致的 encode/decode
     @torch.no_grad()
     def encode(self, img):
-        return self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample() * self.vae.config.scaling_factor
+        # 🌟 VAE CPU-GPU 调度：用时搬到 GPU，用完踢回 CPU
+        self.vae.to(self.device)
+        img_tensor = img.to(self.vae.dtype).to(self.device)
+        lat = self.vae.encode(img_tensor).latent_dist.sample() * self.vae.config.scaling_factor
+        self.vae.to("cpu")
+        torch.cuda.empty_cache()
+        return lat
     
     @torch.no_grad()
     def decode(self, lat):
-        return self.vae.decode(lat / self.vae.config.scaling_factor).sample
+        # 🌟 VAE CPU-GPU 调度：用时搬到 GPU，用完踢回 CPU
+        self.vae.to(self.device)
+        lat = lat.to(self.device)
+        sample = self.vae.decode(lat / self.vae.config.scaling_factor).sample
+        self.vae.to("cpu")
+        torch.cuda.empty_cache()
+        return sample
     
     # 🌟 与训练代码完全一致的 forward
     @torch.no_grad()
@@ -425,6 +467,10 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--pixel_weight', type=float, default=None)
     
+    # 🌟 添加最大尺寸限制
+    parser.add_argument('--max_size', type=int, default=1536,
+                        help='Maximum image dimension (default: 1536). Larger images will be resized.')
+    
     # CLEAR 参数
     parser.add_argument('--window_size', type=int, default=16)
     parser.add_argument('--down_factor', type=int, default=4)
@@ -480,6 +526,7 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
+    print(f"Max size: {args.max_size} (images larger than this will be resized)")
     if args.force_512:
         print("⚠️  Force 512x512 mode enabled")
     print(f"Output: {output_dir}")
@@ -526,6 +573,17 @@ def main():
             lr_img = lr_img.resize((W // 4, H // 4), Image.BICUBIC)
         else:
             orig_W, orig_H = hr_img.size
+            
+            # 🌟 限制最大尺寸，避免 OOM
+            max_dim = max(orig_W, orig_H)
+            if max_dim > args.max_size:
+                scale = args.max_size / max_dim
+                orig_W = int(orig_W * scale)
+                orig_H = int(orig_H * scale)
+                hr_img = hr_img.resize((orig_W, orig_H), Image.BICUBIC)
+                lr_img = lr_img.resize((orig_W // 4, orig_H // 4), Image.BICUBIC)
+            
+            # 对齐到 64 的倍数
             W = orig_W - (orig_W % 64)
             H = orig_H - (orig_H % 64)
             hr_img = hr_img.crop((0, 0, W, H))
@@ -547,7 +605,15 @@ def main():
         sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=args.num_steps, guidance=args.guidance)
         sr_t = evaluator.decode(sr_lat)
         
+        # 🌟 立即释放不需要的 tensor
+        del lr_lat, sr_lat, lr_t
+        torch.cuda.empty_cache()
+        
         sr_np = ((sr_t[0].float().cpu().clamp(-1, 1) + 1) * 127.5).numpy().transpose(1, 2, 0).astype(np.uint8)
+        
+        # 🌟 立即释放 sr_t
+        del sr_t
+        torch.cuda.empty_cache()
         
         # 计算指标
         psnr_val = calculate_psnr(sr_np, hr_np)
@@ -580,7 +646,12 @@ def main():
             comp.paste(hr_img, (W * 3, 0))
             comp.save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
         
+        # 🌟 更积极地清理内存
+        del hr_np, sr_np, lr_bicubic_np
+        if lpips_fn:
+            del hr_t, sr_t_lpips, lr_t_lpips
         torch.cuda.empty_cache()
+        gc.collect()
     
     # 汇总
     avg_psnr = np.mean(psnr_list)
