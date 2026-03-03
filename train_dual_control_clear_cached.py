@@ -1,37 +1,28 @@
 #!/usr/bin/env python
 """
-Dual-Stream FLUX SR ControlNet Training with CLEAR Acceleration
+Dual-Stream FLUX SR Training with CLEAR + Latent Caching
 
-🚀 CLEAR 加速 + 详细日志记录
-
-⚠️ 前置步骤：下载 CLEAR 文件和预训练权重
-    wget https://raw.githubusercontent.com/Huage001/CLEAR/main/transformer_flux.py
-    wget https://raw.githubusercontent.com/Huage001/CLEAR/main/attention_processor.py
-    mkdir ckpt
-    wget https://huggingface.co/Huage001/CLEAR/resolve/main/clear_local_16_down_4.safetensors \
-         -O ckpt/clear_local_16_down_4.safetensors
-
-Usage:
-    accelerate launch --num_processes=8 --use_deepspeed train_dual_control_clear.py \
-        --hr_dir Data/DIV2K/DIV2K_train_HR \
-        --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --epochs 120 --lr 1e-5 \
-        --window_size 16 --down_factor 4 \
-        --clear_ckpt ckpt/clear_local_16_down_4.safetensors
-
-    accelerate launch --num_processes=8 train_dual_control_clear.py \
-        --hr_dir Data/Mix15K_HR \
-        --lr_dir Data/Mix15K_LR_bicubic_X4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --epochs 80 --lr 1e-5 \
-        --window_size 16 --down_factor 4 \
-        --clear_ckpt ckpt/clear_local_16_down_4.safetensors
+accelerate launch --num_processes=8 train_dual_control_clear_cached.py \
+    --latent_dir Data/Mix16K_latents \
+    --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
+    --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
+    --batch_size 4 \
+    --epochs 80 \
+    --lr 1e-5 \
+    --warmup_epochs 3 \
+    --val_interval 5 \
+    --save_interval 10 \
+    --clear_ckpt ckpt/clear_local_16_down_4.safetensors
 """
 
 import os
+import sys
+
+# 🚀 禁用 Triton AUTOTUNE 日志（必须在 import torch 之前）
+os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+os.environ["TORCH_LOGS"] = "-all"
+os.environ["TORCH_COMPILE_DEBUG"] = "0"
+
 import gc
 import math
 import argparse
@@ -39,10 +30,10 @@ import numpy as np
 from datetime import datetime
 from PIL import Image
 import time
-# 🚀 禁用 Triton AUTOTUNE 日志（必须在 import torch 之前）
-os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
-os.environ["TORCH_LOGS"] = "-all"
-os.environ["TORCH_COMPILE_DEBUG"] = "0"
+import warnings
+warnings.filterwarnings("ignore")
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,18 +41,23 @@ from torch.utils.data import Dataset, DataLoader
 import torch._inductor.config as inductor_config
 inductor_config.max_autotune = True
 inductor_config.coordinate_descent_tuning = True
-inductor_config.verbose_progress = False  # 禁用详细输出
-# 🚀 CUDA 优化设置
-torch.backends.cudnn.benchmark = True  # 自动选择最快的卷积算法
-torch.backends.cuda.matmul.allow_tf32 = True  # 允许 TF32 加速矩阵乘法
-torch.backends.cudnn.allow_tf32 = True  # 允许 TF32 加速卷积
-torch.set_float32_matmul_precision('medium')  # 使用 medium 精度加速
+inductor_config.verbose_progress = False  # 🚀 禁用详细输出
+
+# 禁用 torch 相关日志
+import logging
+for name in ['torch', 'torch._dynamo', 'torch._inductor', 'torch._functorch', 'torch.fx', 'triton']:
+    logging.getLogger(name).setLevel(logging.ERROR)
+
+# 🚀 CUDA 优化
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('medium')
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm import tqdm
 
-# 🌟 从 CLEAR 仓库导入
 from attention_processor import (
     LocalFlexAttnProcessor, 
     LocalDownsampleFlexAttnProcessor,
@@ -102,10 +98,62 @@ class PixelFeatureExtractor(nn.Module):
 
 
 # ============================================================================
-# Dataset
+# Cached Latent Dataset
+# ============================================================================
+
+class CachedLatentDataset(Dataset):
+    """从磁盘加载预缓存的 latent"""
+    
+    def __init__(self, latent_dir):
+        self.latent_dir = Path(latent_dir)
+        
+        # 加载索引
+        index_path = self.latent_dir / 'index.pt'
+        if index_path.exists():
+            index = torch.load(index_path, weights_only=True)
+            self.files = index['files']
+            self.resolution = index['resolution']
+        else:
+            # 直接扫描目录
+            self.files = [f.stem for f in sorted(self.latent_dir.glob("*.pt")) 
+                         if f.stem not in ['config', 'index']]
+            config = torch.load(self.latent_dir / 'config.pt', weights_only=True)
+            self.resolution = config['resolution']
+        
+        # 展开所有 crops
+        self.samples = []
+        for f in self.files:
+            data = torch.load(self.latent_dir / f"{f}.pt", weights_only=True)
+            num_crops = data.get('num_crops', 1)
+            for c in range(num_crops):
+                self.samples.append((f, c))
+        
+        print(f"[CachedDataset] Loaded {len(self.files)} files, {len(self.samples)} samples")
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        filename, crop_idx = self.samples[idx]
+        data = torch.load(self.latent_dir / f"{filename}.pt", weights_only=True)
+        
+        hr_lat = data['hr_latents'][crop_idx].squeeze(0).float()  # [16, H, W]
+        lr_lat = data['lr_latents'][crop_idx].squeeze(0).float()  # [16, H, W]
+        lr_pixel = data['lr_pixels'][crop_idx].squeeze(0).float()  # [3, H, W]
+        
+        return {
+            'hr_lat': hr_lat,
+            'lr_lat': lr_lat,
+            'lr_pixel': lr_pixel,
+        }
+
+
+# ============================================================================
+# Validation Dataset (still uses images)
 # ============================================================================
 
 class SRDataset(Dataset):
+    """用于验证的原始图像数据集"""
     def __init__(self, hr_dir, lr_dir, resolution=512):
         self.hr_dir = hr_dir
         self.lr_dir = lr_dir
@@ -143,10 +191,12 @@ class SRDataset(Dataset):
 
 
 # ============================================================================
-# Dual-Stream FLUX SR System with CLEAR
+# Dual-Stream FLUX SR System (No VAE in training loop)
 # ============================================================================
 
-class DualStreamFLUXSR_CLEAR(nn.Module):
+class DualStreamFLUXSR_Cached(nn.Module):
+    """使用缓存 latent 的训练系统，不需要 VAE"""
+    
     def __init__(self, model_name, device, pretrained_controlnet=None,
                  train_controlnet=True, pixel_weight=0.1,
                  window_size=16, down_factor=4, clear_ckpt=None, resolution=512):
@@ -158,9 +208,9 @@ class DualStreamFLUXSR_CLEAR(nn.Module):
         self.window_size = window_size
         self.down_factor = down_factor
         self.clear_ckpt = clear_ckpt
-        self.resolution = resolution  # 🌟 保存 resolution
+        self.resolution = resolution
         
-        self.vae = None
+        self.vae = None  # 只在验证时加载
         self.transformer = None
         self.controlnet = None
         self.pixel_extractor = None
@@ -169,10 +219,9 @@ class DualStreamFLUXSR_CLEAR(nn.Module):
         self._load_models(pretrained_controlnet)
     
     def _load_models(self, pretrained_controlnet):
-        from diffusers import AutoencoderKL, FluxControlNetModel
+        from diffusers import FluxControlNetModel
         from transformer_flux import FluxTransformer2DModel
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
-        from safetensors.torch import load_file
         import time as time_module
         
         dtype = torch.bfloat16
@@ -181,14 +230,7 @@ class DualStreamFLUXSR_CLEAR(nn.Module):
         if local_rank > 0:
             time_module.sleep(local_rank * 5)
         
-        print(f"[Rank {local_rank}] Loading VAE...")
-        self.vae = AutoencoderKL.from_pretrained(
-            self.model_name, subfolder="vae", torch_dtype=dtype
-        ).to(self.device)
-        self.vae.requires_grad_(False)
-        #self.vae.enable_tiling()  # 🚀 启用 VAE Tiling 降低显存峰值
-        
-        print(f"[Rank {local_rank}] Caching text embeddings...")
+        # 缓存 text embeddings
         text_enc = CLIPTextModel.from_pretrained(
             self.model_name, subfolder="text_encoder", torch_dtype=dtype
         ).to(self.device)
@@ -213,7 +255,7 @@ class DualStreamFLUXSR_CLEAR(nn.Module):
         torch.cuda.empty_cache()
         gc.collect()
         
-        print(f"[Rank {local_rank}] Loading FLUX Transformer...")
+        # 加载 Transformer
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
@@ -222,81 +264,79 @@ class DualStreamFLUXSR_CLEAR(nn.Module):
         if self.clear_ckpt:
             self._enable_clear(local_rank, dtype)
         
-        print(f"[Rank {local_rank}] Loading ControlNet...")
+        # 加载 ControlNet
         self.controlnet = FluxControlNetModel.from_pretrained(
             pretrained_controlnet, torch_dtype=dtype
         ).to(self.device)
         
         if self.train_controlnet:
             self.controlnet.requires_grad_(True)
+            try:
+                self.controlnet.enable_xformers_memory_efficient_attention()
+            except:
+                pass
+            try:
+                self.controlnet.enable_gradient_checkpointing()
+            except:
+                pass
         else:
             self.controlnet.requires_grad_(False)
         
-        print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
+        # Pixel Extractor
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.requires_grad_(True)
-
-        # 🌟 为 ControlNet 启用显存优化 (Flash Attention)
-        if self.train_controlnet:
-            try:
-                self.controlnet.enable_xformers_memory_efficient_attention()
-                print(f"[Rank {local_rank}] ControlNet Xformers enabled")
-            except Exception as e:
-                print(f"[Rank {local_rank}] Warning: Xformers not enabled for ControlNet: {e}")
-            
-            # 🚀 启用 Gradient Checkpointing 节省显存（用时间换空间）
-            try:
-                self.controlnet.enable_gradient_checkpointing()
-                print(f"[Rank {local_rank}] ControlNet Gradient Checkpointing enabled")
-            except Exception as e:
-                print(f"[Rank {local_rank}] Warning: Gradient Checkpointing not enabled: {e}")
-
-        print(f"[Rank {local_rank}] GPU memory: {torch.cuda.memory_allocated(self.device)/1e9:.2f} GB")
         
         print(f"[Rank {local_rank}] GPU memory: {torch.cuda.memory_allocated(self.device)/1e9:.2f} GB")
     
     def _enable_clear(self, local_rank, dtype):
         from safetensors.torch import load_file
         
-        # 🌟 修复：根据 resolution 动态计算 latent_size
-        # 512x512 -> latent 32x32, 1024x1024 -> latent 64x64
         latent_size = self.resolution // 16
         text_length = 512
         
-        print(f"[Rank {local_rank}] [CLEAR] window_size={self.window_size}, down_factor={self.down_factor}, latent={latent_size}x{latent_size}")
-        
-        # 1. 初始化 Mask
         if self.down_factor == 1:
             init_local_mask_flex(latent_size, latent_size, text_length, self.window_size, self.device)
         else:
             init_local_downsample_mask_flex(latent_size, latent_size, text_length, 
                                            self.window_size, self.down_factor, self.device)
-            
-        # 2. 🌟 核心修复：精准投递，只替换双流模块 (transformer_blocks)
+        
+        # 只替换双流模块
         original_processors = self.transformer.attn_processors
         attn_processors = {}
         
         for k, proc in original_processors.items():
             if k.startswith("transformer_blocks"):
-                # 双流模块：使用 CLEAR
                 if self.down_factor > 1:
                     attn_processors[k] = LocalDownsampleFlexAttnProcessor(self.down_factor).to(self.device, dtype)
                 else:
                     attn_processors[k] = LocalFlexAttnProcessor()
             else:
-                # 🌟 单流模块 (single_transformer_blocks)：保留原生处理器！
                 attn_processors[k] = proc
         
         self.transformer.set_attn_processor(attn_processors)
-        
-        # 3. 加载权重
-        print(f"[Rank {local_rank}] [CLEAR] Loading pretrained weights: {self.clear_ckpt}")
         clear_state_dict = load_file(self.clear_ckpt)
-        missing, _ = self.transformer.load_state_dict(clear_state_dict, strict=False)
+        self.transformer.load_state_dict(clear_state_dict, strict=False)
         
-        # 验证加载情况
-        valid_clear_keys = [k for k in attn_processors.keys() if k.startswith("transformer_blocks")]
-        print(f"[Rank {local_rank}] [CLEAR] Applied to {len(valid_clear_keys)} layers. Single blocks kept native.")
+        clear_count = sum(1 for k in attn_processors if k.startswith("transformer_blocks"))
+        print(f"[Rank {local_rank}] [CLEAR] Applied to {clear_count} double blocks")
+    
+    def load_vae_for_validation(self):
+        """验证时才加载 VAE"""
+        if self.vae is None:
+            from diffusers import AutoencoderKL
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.vae = AutoencoderKL.from_pretrained(
+                self.model_name, subfolder="vae", torch_dtype=torch.bfloat16
+            ).to(self.device)
+            self.vae.requires_grad_(False)
+            self.vae.enable_tiling()
+    
+    def unload_vae(self):
+        """验证后卸载 VAE 释放显存"""
+        if self.vae is not None:
+            del self.vae
+            self.vae = None
+            torch.cuda.empty_cache()
     
     def get_trainable_params(self):
         params = list(self.pixel_extractor.parameters())
@@ -322,57 +362,84 @@ class DualStreamFLUXSR_CLEAR(nn.Module):
     
     @torch.no_grad()
     def encode(self, img):
+        """只在验证时使用"""
         return self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample() * self.vae.config.scaling_factor
     
     @torch.no_grad()
     def decode(self, lat):
+        """只在验证时使用"""
         return self.vae.decode(lat / self.vae.config.scaling_factor).sample
     
     def forward(self, noisy, lr_lat, lr_pixel, t, guidance=3.5):
+        """前向传播（直接使用缓存的 latent）"""
         B, C, H, W = noisy.shape
-        device, dtype = noisy.device, torch.bfloat16
+        device = noisy.device
+        dtype = torch.bfloat16
         
-        noisy, lr_lat, lr_pixel, t = noisy.to(dtype), lr_lat.to(dtype), lr_pixel.to(dtype), t.to(dtype)
+        noisy = noisy.to(dtype)
+        lr_lat = lr_lat.to(dtype)
+        lr_pixel = lr_pixel.to(dtype)
+        t = t.to(dtype)
         
         prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         pooled = self._cached_embeds['pooled'].expand(B, -1)
         txt_ids = self._cached_embeds['text_ids']
         img_ids = self._img_ids(H, W, device, dtype)
         
+        # Pixel features
         pixel_feat = self.pixel_extractor(lr_pixel).to(dtype)
         fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
         
         packed_noisy = self._pack(noisy)
         packed_cond = self._pack(fused_cond)
         
+        # ControlNet
         ctrl_out = self.controlnet(
-            hidden_states=packed_noisy, controlnet_cond=packed_cond, timestep=t,
-            encoder_hidden_states=prompt, pooled_projections=pooled, txt_ids=txt_ids, img_ids=img_ids,
-            guidance=torch.full((B,), guidance, device=device, dtype=dtype), return_dict=False,
+            hidden_states=packed_noisy,
+            controlnet_cond=packed_cond,
+            timestep=t,
+            encoder_hidden_states=prompt,
+            pooled_projections=pooled,
+            txt_ids=txt_ids,
+            img_ids=img_ids,
+            guidance=torch.full((B,), guidance, device=device, dtype=dtype),
+            return_dict=False,
         )
         
         ctrl_block = [x.to(dtype) for x in ctrl_out[0]] if ctrl_out[0] else None
         ctrl_single = [x.to(dtype) for x in ctrl_out[1]] if ctrl_out[1] else None
         
+        # Transformer
         pred = self.transformer(
-            hidden_states=packed_noisy, timestep=t, encoder_hidden_states=prompt,
-            pooled_projections=pooled, txt_ids=txt_ids, img_ids=img_ids,
+            hidden_states=packed_noisy,
+            timestep=t,
+            encoder_hidden_states=prompt,
+            pooled_projections=pooled,
+            txt_ids=txt_ids,
+            img_ids=img_ids,
             guidance=torch.full((B,), guidance, device=device, dtype=dtype),
-            controlnet_block_samples=ctrl_block, controlnet_single_block_samples=ctrl_single, return_dict=False,
+            controlnet_block_samples=ctrl_block,
+            controlnet_single_block_samples=ctrl_single,
+            return_dict=False,
         )[0]
         
         return self._unpack(pred, H, W)
     
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5):
-        B, dtype = lr_lat.shape[0], torch.bfloat16
+        B = lr_lat.shape[0]
+        dtype = torch.bfloat16
+        
+        lr_lat = lr_lat.to(dtype)
+        lr_pixel = lr_pixel.to(dtype)
+        
         lat = torch.randn_like(lr_lat)
         dt = 1.0 / num_steps
         
         for i in range(num_steps):
             t_val = 1.0 - i * dt
             t = torch.full((B,), t_val, device=lr_lat.device, dtype=dtype)
-            v = self.forward(lat, lr_lat.to(dtype), lr_pixel.to(dtype), t, guidance)
+            v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
             lat = lat - dt * v
         
         return lat
@@ -383,33 +450,42 @@ class DualStreamFLUXSR_CLEAR(nn.Module):
 # ============================================================================
 
 def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel):
-    B, device, dtype = hr_lat.shape[0], hr_lat.device, torch.bfloat16
+    """Flow Matching Loss (直接使用缓存的 latent)"""
+    B = hr_lat.shape[0]
+    device = hr_lat.device
+    dtype = torch.bfloat16
+    
+    hr_lat = hr_lat.to(dtype)
+    lr_lat = lr_lat.to(dtype)
+    lr_pixel = lr_pixel.to(dtype)
     
     t = torch.rand(B, device=device, dtype=dtype)
     noise = torch.randn_like(hr_lat)
     
-    t_expand = t.view(B, 1, 1, 1)
-    z_t = (1 - t_expand) * hr_lat + t_expand * noise
-    v_target = noise - hr_lat
+    x_t = t.view(B, 1, 1, 1) * noise + (1 - t.view(B, 1, 1, 1)) * hr_lat
+    target_v = noise - hr_lat
     
-    v_pred = system(z_t, lr_lat, lr_pixel, t)
-    return F.mse_loss(v_pred.float(), v_target.float())
+    pred_v = system(x_t, lr_lat, lr_pixel, t)
+    
+    loss = F.mse_loss(pred_v.float(), target_v.float())
+    return loss
 
 
-def calculate_psnr(img1, img2):
-    img1, img2 = (img1 + 1) / 2, (img2 + 1) / 2
-    mse = F.mse_loss(img1, img2)
-    return float('inf') if mse == 0 else (10 * torch.log10(1.0 / mse)).item()
+def calculate_psnr(pred, target):
+    mse = F.mse_loss(pred, target)
+    if mse == 0:
+        return float('inf')
+    return 10 * torch.log10(4.0 / mse).item()  # 4.0 = 2^2 for [-1, 1] range
 
 
-@torch.no_grad()
 def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20):
+    """验证（需要临时加载 VAE）"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
     unwrapped.controlnet.eval()
     
-    # 🌟 验证开始前：开启 Tiling (保护显存)
-    unwrapped.vae.enable_tiling()
+    # 加载 VAE
+    unwrapped.load_vae_for_validation()
     
     psnr_list = []
     for i, batch in enumerate(val_loader):
@@ -425,8 +501,9 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
     
-    # 🌟 验证结束后：关闭 Tiling (恢复训练速度)
-    unwrapped.vae.disable_tiling()
+    # 卸载 VAE
+    unwrapped.unload_vae()
+    
     return np.mean(psnr_list) if psnr_list else 0.0
 
 
@@ -455,14 +532,12 @@ def format_time(seconds):
 
 def main():
     parser = argparse.ArgumentParser()
-    
-    parser.add_argument('--hr_dir', type=str, required=True)
-    parser.add_argument('--lr_dir', type=str, required=True)
+    parser.add_argument('--latent_dir', type=str, required=True, help='Cached latent directory')
     parser.add_argument('--val_hr_dir', type=str, default=None)
     parser.add_argument('--val_lr_dir', type=str, default=None)
-    
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
     parser.add_argument('--pretrained_controlnet', type=str, default='jasperai/Flux.1-dev-Controlnet-Upscaler')
+    
     parser.add_argument('--train_controlnet', action='store_true', default=True)
     parser.add_argument('--freeze_controlnet', action='store_true', default=False)
     parser.add_argument('--pixel_weight', type=float, default=0.1)
@@ -471,38 +546,27 @@ def main():
     parser.add_argument('--down_factor', type=int, default=4)
     parser.add_argument('--clear_ckpt', type=str, required=True)
     
-    parser.add_argument('--resolution', type=int, default=512)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--gradient_accumulation', type=int, default=1,
-                        help='Gradient accumulation steps (increase to simulate larger batch)')
+    parser.add_argument('--epochs', type=int, default=60)
+    parser.add_argument('--batch_size', type=int, default=4)  # 可以用更大 batch
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--val_interval', type=int, default=10)
     parser.add_argument('--save_interval', type=int, default=20)
-    parser.add_argument('--compile_model', action='store_true', help='Use torch.compile for ControlNet')
     
-    parser.add_argument('--output_dir', type=str, default='./checkpoints/dual_clear')
+    parser.add_argument('--output_dir', type=str, default='./checkpoints/dual_clear_cached')
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--seed', type=int, default=42)
     
     args = parser.parse_args()
     
-    if not os.path.exists(args.clear_ckpt):
-        print("=" * 70)
-        print("❌ ERROR: CLEAR checkpoint not found!")
-        print(f"   Path: {args.clear_ckpt}")
-        print("\n📥 Download: wget https://huggingface.co/Huage001/CLEAR/resolve/main/clear_local_16_down_4.safetensors -O ckpt/clear_local_16_down_4.safetensors")
-        print("=" * 70)
-        return
+    # 从缓存目录读取 resolution
+    config = torch.load(os.path.join(args.latent_dir, 'config.pt'), weights_only=True)
+    args.resolution = config['resolution']
     
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     
-    accelerator = Accelerator(
-        mixed_precision='bf16', 
-        gradient_accumulation_steps=args.gradient_accumulation
-    )
+    accelerator = Accelerator(mixed_precision='bf16', gradient_accumulation_steps=1)
     device = accelerator.device
     is_main = accelerator.is_main_process
     
@@ -512,7 +576,7 @@ def main():
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode = "ctrl+pixel" if train_controlnet else "pixel_only"
-    save_dir = os.path.join(args.output_dir, f"{timestamp}_{mode}_pw{args.pixel_weight}_clear{args.window_size}_d{args.down_factor}")
+    save_dir = os.path.join(args.output_dir, f"{timestamp}_{mode}_pw{args.pixel_weight}_cached")
     
     log_file = None
     training_start_time = time.time()
@@ -521,58 +585,30 @@ def main():
         os.makedirs(save_dir, exist_ok=True)
         log_file = os.path.join(save_dir, 'training_log.txt')
         
-        # 🌟 初始化日志文件
         with open(log_file, 'w') as f:
             f.write("=" * 70 + "\n")
-            f.write("Dual-Stream FLUX SR Training with CLEAR Acceleration\n")
+            f.write("FLUX SR Training with CLEAR + Latent Caching\n")
             f.write("=" * 70 + "\n\n")
-            f.write(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write("Configuration:\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"  Model: {args.model_name}\n")
-            f.write(f"  ControlNet: {args.pretrained_controlnet}\n")
-            f.write(f"  CLEAR checkpoint: {args.clear_ckpt}\n")
-            f.write(f"  Window size: {args.window_size}\n")
-            f.write(f"  Down factor: {args.down_factor}\n")
-            f.write(f"  Pixel weight: {args.pixel_weight}\n")
-            f.write(f"  Mode: {'ControlNet + Pixel Extractor' if train_controlnet else 'Pixel Extractor only'}\n")
-            f.write(f"  Resolution: {args.resolution}\n")
-            f.write(f"  Epochs: {args.epochs}\n")
-            f.write(f"  Batch size: {args.batch_size}\n")
-            f.write(f"  Gradient accumulation: {args.gradient_accumulation}\n")
-            f.write(f"  Effective batch size: {args.batch_size * args.gradient_accumulation * accelerator.num_processes}\n")
-            f.write(f"  Learning rate: {args.lr}\n")
-            f.write(f"  Warmup epochs: {args.warmup_epochs}\n")
-            f.write(f"  GPUs: {accelerator.num_processes}\n")
-            f.write(f"  torch.compile: {args.compile_model}\n")
-            f.write(f"  Seed: {args.seed}\n\n")
-            f.write("Dataset:\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"  Train HR: {args.hr_dir}\n")
-            f.write(f"  Train LR: {args.lr_dir}\n")
-            f.write(f"  Val HR: {args.val_hr_dir}\n")
-            f.write(f"  Val LR: {args.val_lr_dir}\n\n")
+            f.write(f"Latent Dir: {args.latent_dir}\n")
+            f.write(f"Resolution: {args.resolution}\n")
+            f.write(f"CLEAR: window={args.window_size}, down={args.down_factor}\n")
+            f.write(f"Batch Size: {args.batch_size}\n\n")
         
         print("=" * 70)
-        print("🚀 Dual-Stream FLUX SR with CLEAR Acceleration")
+        print("🚀 FLUX SR with CLEAR + Latent Caching")
         print("=" * 70)
-        print(f"CLEAR: window_size={args.window_size}, down_factor={args.down_factor}")
-        print(f"Pixel Weight: {args.pixel_weight}")
-        print(f"Output: {save_dir}")
+        print(f"Latent Dir: {args.latent_dir}")
+        print(f"Resolution: {args.resolution}")
+        print(f"CLEAR: window={args.window_size}, down={args.down_factor}")
+        print(f"Batch Size: {args.batch_size}")
         print("=" * 70)
     
-    system = DualStreamFLUXSR_CLEAR(
+    system = DualStreamFLUXSR_Cached(
         args.model_name, device, args.pretrained_controlnet,
         train_controlnet=train_controlnet, pixel_weight=args.pixel_weight,
-        window_size=args.window_size, down_factor=args.down_factor, 
+        window_size=args.window_size, down_factor=args.down_factor,
         clear_ckpt=args.clear_ckpt, resolution=args.resolution,
     )
-    
-    # 🚀 可选：torch.compile 加速 ControlNet
-    if args.compile_model and train_controlnet:
-        if is_main:
-            print("[Compile] Compiling ControlNet with torch.compile...")
-        system.controlnet = torch.compile(system.controlnet, mode='reduce-overhead')
     
     trainable_params = system.get_trainable_params()
     total_params = sum(p.numel() for p in trainable_params)
@@ -585,27 +621,22 @@ def main():
     else:
         optimizer_params = [{"params": system.pixel_extractor.parameters(), "lr": args.lr * 10.0}]
     
-    train_dataset = SRDataset(args.hr_dir, args.lr_dir, args.resolution)
-    
-    # 🚀 优化 DataLoader
-    num_workers = min(8, os.cpu_count() or 4)  # 自动检测 CPU 核心数
+    # 使用缓存的 Dataset
+    train_dataset = CachedLatentDataset(args.latent_dir)
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True, 
-        persistent_workers=True, 
-        prefetch_factor=4,  # 提高预取数量
-        drop_last=True,  # 🚀 丢弃不完整的最后一个 batch，避免不一致
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+        drop_last=True,
     )
     
     if is_main:
         print(f"[Training] Trainable parameters: {total_params:,}")
         print(f"[Data] Training samples: {len(train_dataset)}")
-        with open(log_file, 'a') as f:
-            f.write(f"Trainable parameters: {total_params:,}\n")
-            f.write(f"Training samples: {len(train_dataset)}\n")
     
     val_loader = None
     if args.val_hr_dir and args.val_lr_dir:
@@ -613,8 +644,6 @@ def main():
         val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
         if is_main:
             print(f"[Data] Validation samples: {len(val_dataset)}")
-            with open(log_file, 'a') as f:
-                f.write(f"Validation samples: {len(val_dataset)}\n\n")
     
     optimizer = torch.optim.AdamW(optimizer_params, weight_decay=0.01)
     
@@ -644,15 +673,7 @@ def main():
         start_epoch = ckpt.get('epoch', 0) + 1
         best_psnr = ckpt.get('psnr', 0.0)
     
-    history = {'train_loss': [], 'val_psnr': [], 'epoch_times': []}
-    
-    # 🌟 写入训练进度表头
     if is_main:
-        with open(log_file, 'a') as f:
-            f.write("Training Progress:\n")
-            f.write("-" * 70 + "\n")
-            f.write(f"{'Epoch':<8} {'Loss':<12} {'Val PSNR':<12} {'LR':<14} {'Time':<12} {'Total Time':<12}\n")
-            f.write("-" * 70 + "\n")
         print("\n[Training] Starting...\n")
     
     for epoch in range(start_epoch, args.epochs):
@@ -667,82 +688,58 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not is_main)
         
         for batch in pbar:
-            hr = batch['hr'].to(device).to(torch.bfloat16)
-            lr = batch['lr'].to(device).to(torch.bfloat16)
-            
-            with torch.no_grad():
-                hr_lat = unwrapped.encode(hr)
-                lr_lat = unwrapped.encode(lr)
+            # 🚀 直接使用缓存的 latent，无需 VAE 编码
+            hr_lat = batch['hr_lat'].to(device).to(torch.bfloat16)
+            lr_lat = batch['lr_lat'].to(device).to(torch.bfloat16)
+            lr_pixel = batch['lr_pixel'].to(device).to(torch.bfloat16)
             
             with accelerator.accumulate(system):
                 with accelerator.autocast():
-                    loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr)
+                    loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel)
                 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad(set_to_none=True)  # 🚀 比 zero_grad() 更快
+                optimizer.zero_grad(set_to_none=True)
             
             epoch_losses.append(loss.item())
             pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.2e}'})
         
         epoch_time = time.time() - epoch_start
-        total_time = time.time() - training_start_time
         avg_loss = np.mean(epoch_losses)
-        history['train_loss'].append(avg_loss)
-        history['epoch_times'].append(epoch_time)
         
         if is_main:
             val_psnr = 0.0
             if val_loader and (epoch + 1) % args.val_interval == 0:
                 val_psnr = validate(system, accelerator, val_loader, device, num_samples=5)
-                history['val_psnr'].append(val_psnr)
                 print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}, Val PSNR: {val_psnr:.2f} dB, Time: {format_time(epoch_time)}")
             else:
                 print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}, Time: {format_time(epoch_time)}")
             
-            # 🌟 写入日志
             with open(log_file, 'a') as f:
-                psnr_str = f"{val_psnr:.2f}" if val_psnr > 0 else "-"
-                f.write(f"{epoch+1:<8} {avg_loss:<12.6f} {psnr_str:<12} {scheduler.get_last_lr()[0]:<14.2e} {format_time(epoch_time):<12} {format_time(total_time):<12}\n")
+                f.write(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, Time={format_time(epoch_time)}\n")
             
             torch.cuda.empty_cache()
             
             if (epoch + 1) % args.save_interval == 0:
-                save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr, args, os.path.join(save_dir, f'epoch{epoch+1}.pt'))
+                save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr, args, 
+                              os.path.join(save_dir, f'epoch{epoch+1}.pt'))
             
             if val_psnr > best_psnr:
                 best_psnr = val_psnr
-                save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr, args, os.path.join(save_dir, 'best_model.pt'))
+                save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr, args,
+                              os.path.join(save_dir, 'best_model.pt'))
                 print(f"[Epoch {epoch+1}] ✓ New best PSNR: {best_psnr:.2f} dB")
         
         accelerator.wait_for_everyone()
     
-    total_training_time = time.time() - training_start_time
-    
     if is_main:
-        save_checkpoint(system, accelerator, args.epochs - 1, avg_loss, best_psnr, args, os.path.join(save_dir, 'final_model.pt'))
-        
-        # 🌟 写入训练总结
-        with open(log_file, 'a') as f:
-            f.write("\n" + "=" * 70 + "\n")
-            f.write("Training Summary\n")
-            f.write("=" * 70 + "\n")
-            f.write(f"End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Training Time: {format_time(total_training_time)}\n")
-            f.write(f"Average Epoch Time: {format_time(np.mean(history['epoch_times']))}\n")
-            f.write(f"Final Loss: {avg_loss:.6f}\n")
-            f.write(f"Best Validation PSNR: {best_psnr:.2f} dB\n")
-            f.write(f"Total Epochs: {args.epochs}\n")
-            f.write(f"Checkpoints: {save_dir}\n")
-        
         print("\n" + "=" * 70)
         print("✅ Training Complete!")
-        print(f"Total Time: {format_time(total_training_time)}")
         print(f"Best PSNR: {best_psnr:.2f} dB")
-        print(f"Log file: {log_file}")
+        print(f"Output: {save_dir}")
         print("=" * 70)
 
 

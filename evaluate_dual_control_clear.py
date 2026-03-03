@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 """
 Dual-Stream FLUX SR Evaluation with CLEAR Acceleration
+
+python evaluate_dual_control_clear.py \
+    --checkpoint checkpoints/xxx/best_model.pt \
+    --hr_dir Data/DIV2K/DIV2K_valid_HR \
+    --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4
+
 """
 
 import os
