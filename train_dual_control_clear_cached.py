@@ -547,10 +547,10 @@ def main():
     parser.add_argument('--clear_ckpt', type=str, required=True)
     
     parser.add_argument('--epochs', type=int, default=60)
-    parser.add_argument('--batch_size', type=int, default=4)  # 可以用更大 batch
+    parser.add_argument('--batch_size', type=int, default=2) 
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=5)
-    parser.add_argument('--val_interval', type=int, default=10)
+    parser.add_argument('--val_interval', type=int, default=5)
     parser.add_argument('--save_interval', type=int, default=20)
     
     parser.add_argument('--output_dir', type=str, default='./checkpoints/dual_clear_cached')
