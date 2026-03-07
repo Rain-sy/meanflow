@@ -1,18 +1,24 @@
 #!/usr/bin/env python
 """
 Dual-Stream FLUX SR Evaluation with CLEAR Acceleration
-
-python evaluate_dual_control_clear.py \
-    --checkpoint checkpoints/xxx/best_model.pt \
-    --hr_dir Data/DIV2K/DIV2K_valid_HR \
-    --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4
-
 """
 
 import os
 import sys
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# 🌟 在导入 torch 之前检查 --device 参数并设置 CUDA_VISIBLE_DEVICES
+# 这样可以避免 Triton 编译缓存的 device 混合问题
+for i, arg in enumerate(sys.argv):
+    if arg == '--device' and i + 1 < len(sys.argv):
+        device_arg = sys.argv[i + 1]
+        if device_arg.startswith('cuda:'):
+            device_id = device_arg.split(':')[1]
+            os.environ['CUDA_VISIBLE_DEVICES'] = device_id
+            # 修改参数为 cuda:0（因为 CUDA_VISIBLE_DEVICES 会重新映射）
+            sys.argv[i + 1] = 'cuda:0'
+            print(f"[Info] Set CUDA_VISIBLE_DEVICES={device_id}, using cuda:0")
+        break
+
 # 🌟 必须在导入 torch 之前设置这些环境变量
 os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
 os.environ["TORCH_LOGS"] = "-all"
@@ -119,7 +125,7 @@ def calculate_ssim(img1, img2):
 # ============================================================================
 
 class DualStreamEvaluator:
-    def __init__(self, model_name, device, checkpoint_path=None, pixel_weight=0.1,
+    def __init__(self, model_name, device, checkpoint_path=None, pixel_weight=1.0,
                  window_size=16, down_factor=4, clear_ckpt="ckpt/clear_local_16_down_4.safetensors"):
         self.model_name = model_name
         self.device = device
@@ -307,13 +313,8 @@ class DualStreamEvaluator:
         # 如果尺寸没变，不需要更新
         if self._current_mask_size == (patch_h, patch_w):
             return
-
-        # 🌟 致命修复：彻底清空 PyTorch Dynamo 的编译内核缓存！
-        import torch._dynamo
-        torch._dynamo.reset()
         
-        # 释放上一张图的旧 Mask 物理内存
-        attention_processor.BLOCK_MASK = None
+        # 🌟 清理旧的 compiled 函数缓存
         torch.cuda.empty_cache()
         gc.collect()
         
@@ -323,17 +324,18 @@ class DualStreamEvaluator:
         if hasattr(init_local_mask_flex, 'cache_clear'):
             init_local_mask_flex.cache_clear()
         
-        # 🌟 重新初始化 mask（使用 "cuda"）
+        # 🌟 重新初始化 mask（使用正确的 device）
+        device_str = str(self.device)
         if self.down_factor > 1:
             init_local_downsample_mask_flex(
                 height=patch_h, width=patch_w, text_length=512,
                 window_size=self.window_size, down_factor=self.down_factor, 
-                device="cuda"
+                device=device_str
             )
         else:
             init_local_mask_flex(
                 height=patch_h, width=patch_w, text_length=512,
-                window_size=self.window_size, device="cuda"
+                window_size=self.window_size, device=device_str
             )
         
         # 更新全局变量
@@ -399,6 +401,13 @@ class DualStreamEvaluator:
         img_ids = self._img_ids(H, W, device, dtype)
         
         pixel_feat = self.pixel_extractor(lr_pixel).to(dtype)
+        
+        # 🚀 修复尺寸不匹配：PixelExtractor 输出 /16，VAE latent 是 /8
+        if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
+            pixel_feat = F.interpolate(
+                pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
+            )
+        
         fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
         
         packed_noisy = self._pack(noisy)
@@ -438,22 +447,56 @@ class DualStreamEvaluator:
     
     # 🌟 与训练代码完全一致的 inference
     @torch.no_grad()
-    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5):
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, start_t=0.8):
+        """
+        Flow Matching 推理 (使用官方 scheduler)
+        
+        Args:
+            lr_lat: LR 图像的 latent
+            lr_pixel: LR 图像 (用于 PixelFeatureExtractor)
+            num_steps: 去噪步数
+            guidance: CFG 强度
+            start_t: 起始 t 值 (1.0=纯噪声, <1.0 从 LR 插值开始，推荐 0.8)
+        """
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        
         B = lr_lat.shape[0]
         dtype = torch.bfloat16
+        device = lr_lat.device
         
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        lat = torch.randn_like(lr_lat)
-        dt = 1.0 / num_steps
+        # 加载官方 scheduler
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            self.model_name, subfolder="scheduler"
+        )
+        scheduler.set_timesteps(num_steps, device=device)
         
-        for i in range(num_steps):
-            t_val = 1.0 - i * dt
-            # 🌟 关键：t 在 [0, 1] 范围，不乘 1000！
-            t = torch.full((B,), t_val, device=lr_lat.device, dtype=dtype)
-            v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
-            lat = lat - dt * v
+        # 🚀 关键：从 LR 插值开始，而非纯噪声
+        noise = torch.randn_like(lr_lat)
+        if start_t < 1.0:
+            # SR 模式：从 LR 和噪声的插值开始
+            lat = start_t * noise + (1 - start_t) * lr_lat
+            # 跳过前面的 timesteps
+            start_idx = int((1.0 - start_t) * num_steps)
+            timesteps = scheduler.timesteps[start_idx:]
+        else:
+            # 标准模式：从纯噪声开始
+            lat = noise * scheduler.init_noise_sigma
+            timesteps = scheduler.timesteps
+        
+        # 去噪循环
+        for t in timesteps:
+            # FLUX 使用 [0, 1] 范围的 t
+            t_normalized = t / 1000.0 if t > 1 else t
+            t_batch = torch.full((B,), t_normalized, device=device, dtype=dtype)
+            
+            # 预测 velocity
+            v = self.forward(lat, lr_lat, lr_pixel, t_batch, guidance)
+            
+            # scheduler.step 执行更新
+            lat = scheduler.step(v, t, lat, return_dict=False)[0]
         
         return lat
 
@@ -471,6 +514,8 @@ def main():
     
     parser.add_argument('--num_steps', type=int, default=20)
     parser.add_argument('--guidance', type=float, default=3.5)
+    parser.add_argument('--start_t', type=float, default=0.8,
+                        help='Start t for inference (1.0=pure noise, <1.0=interpolate with LR, recommended 0.8)')
     parser.add_argument('--pixel_weight', type=float, default=None)
     
     # 🌟 添加最大尺寸限制
@@ -495,6 +540,7 @@ def main():
                         help='Force 512x512 evaluation to match training resolution')
     
     args = parser.parse_args()
+    
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     
     # Auto-detect dataset
@@ -608,7 +654,7 @@ def main():
         
         # 推理
         lr_lat = evaluator.encode(lr_t)
-        sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=args.num_steps, guidance=args.guidance)
+        sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=args.num_steps, guidance=args.guidance, start_t=args.start_t)
         sr_t = evaluator.decode(sr_lat)
         
         # 🌟 立即释放不需要的 tensor
@@ -653,7 +699,7 @@ def main():
             comp.save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
         
         # 🌟 更积极地清理内存
-        del hr_np, sr_np, lr_bicubic_np
+        del sr_np, hr_np, lr_bicubic_np
         if lpips_fn:
             del hr_t, sr_t_lpips, lr_t_lpips
         torch.cuda.empty_cache()

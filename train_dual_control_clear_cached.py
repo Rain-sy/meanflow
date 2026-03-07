@@ -2,11 +2,11 @@
 """
 Dual-Stream FLUX SR Training with CLEAR + Latent Caching
 
-accelerate launch --num_processes=8 train_dual_control_clear_cached.py \
-    --latent_dir Data/Mix16K_latents \
+accelerate launch --num_processes=8 --gradient_accumulation_steps 2 train_dual_control_clear_cached.py \
+    --latent_dir Data/Mix10K_latents \
     --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
     --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-    --batch_size 4 \
+    --batch_size 2 \
     --epochs 80 \
     --lr 1e-5 \
     --warmup_epochs 3 \
@@ -128,7 +128,6 @@ class CachedLatentDataset(Dataset):
             for c in range(num_crops):
                 self.samples.append((f, c))
         
-        print(f"[CachedDataset] Loaded {len(self.files)} files, {len(self.samples)} samples")
     
     def __len__(self):
         return len(self.samples)
@@ -261,6 +260,12 @@ class DualStreamFLUXSR_Cached(nn.Module):
         ).to(self.device)
         self.transformer.requires_grad_(False)
         
+        # 🚀 Transformer 也开启 gradient checkpointing（节省激活值显存）
+        try:
+            self.transformer.enable_gradient_checkpointing()
+        except:
+            pass
+        
         if self.clear_ckpt:
             self._enable_clear(local_rank, dtype)
         
@@ -318,7 +323,6 @@ class DualStreamFLUXSR_Cached(nn.Module):
         self.transformer.load_state_dict(clear_state_dict, strict=False)
         
         clear_count = sum(1 for k in attn_processors if k.startswith("transformer_blocks"))
-        print(f"[Rank {local_rank}] [CLEAR] Applied to {clear_count} double blocks")
     
     def load_vae_for_validation(self):
         """验证时才加载 VAE"""
@@ -503,7 +507,6 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
     
     # 卸载 VAE
     unwrapped.unload_vae()
-    
     return np.mean(psnr_list) if psnr_list else 0.0
 
 
@@ -540,7 +543,7 @@ def main():
     
     parser.add_argument('--train_controlnet', action='store_true', default=True)
     parser.add_argument('--freeze_controlnet', action='store_true', default=False)
-    parser.add_argument('--pixel_weight', type=float, default=0.1)
+    parser.add_argument('--pixel_weight', type=float, default=1)
     
     parser.add_argument('--window_size', type=int, default=16)
     parser.add_argument('--down_factor', type=int, default=4)
@@ -550,8 +553,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=2) 
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=5)
-    parser.add_argument('--val_interval', type=int, default=5)
-    parser.add_argument('--save_interval', type=int, default=20)
+    parser.add_argument('--val_interval', type=int, default=2)
+    parser.add_argument('--save_interval', type=int, default=10)
     
     parser.add_argument('--output_dir', type=str, default='./checkpoints/dual_clear_cached')
     parser.add_argument('--resume', type=str, default=None)
@@ -693,16 +696,15 @@ def main():
             lr_lat = batch['lr_lat'].to(device).to(torch.bfloat16)
             lr_pixel = batch['lr_pixel'].to(device).to(torch.bfloat16)
             
-            with accelerator.accumulate(system):
-                with accelerator.autocast():
-                    loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel)
-                
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(trainable_params, 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+            with accelerator.autocast():
+                loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel)
+            
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(trainable_params, 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
             
             epoch_losses.append(loss.item())
             pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.2e}'})
