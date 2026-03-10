@@ -49,17 +49,44 @@ logging.getLogger("triton").setLevel(logging.ERROR)
 
 
 # ============================================================================
+# FLUX Scheduler Helper
+# ============================================================================
+
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.16,
+):
+    """计算 FLUX scheduler 的动态 mu 参数"""
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
+
+
+# ============================================================================
 # Dataset
 # ============================================================================
 
 class SRDataset(Dataset):
-    """SR Dataset - directly loads images"""
+    """SR Dataset - directly loads images
     
-    def __init__(self, hr_dir, lr_dir, resolution=512, num_crops=5):
+    Args:
+        hr_dir: HR images directory
+        lr_dir: LR images directory  
+        resolution: Target resolution (default 512)
+        num_crops: Number of random crops per image (default 5)
+        full_image: If True, resize whole image instead of cropping (default False)
+    """
+    
+    def __init__(self, hr_dir, lr_dir, resolution=512, num_crops=5, full_image=False):
         self.hr_dir = hr_dir
         self.lr_dir = lr_dir
         self.resolution = resolution
-        self.num_crops = num_crops
+        self.num_crops = num_crops if not full_image else 1  # 整图模式只有 1 个 sample
+        self.full_image = full_image
         
         # Find all images
         self.hr_files = sorted([
@@ -67,7 +94,10 @@ class SRDataset(Dataset):
             if f.lower().endswith(('.png', '.jpg', '.jpeg'))
         ])
         
-        print(f"[Dataset] Found {len(self.hr_files)} images, {num_crops} crops each = {len(self.hr_files) * num_crops} samples")
+        if full_image:
+            print(f"[Dataset] Found {len(self.hr_files)} images (full image mode, resize to {resolution})")
+        else:
+            print(f"[Dataset] Found {len(self.hr_files)} images, {num_crops} crops each = {len(self.hr_files) * num_crops} samples")
     
     def __len__(self):
         return len(self.hr_files) * self.num_crops
@@ -85,10 +115,13 @@ class SRDataset(Dataset):
         
         # Find LR image
         lr_path = None
-        for ext in ['.png', '.jpg', '.jpeg']:
-            candidate = os.path.join(self.lr_dir, base_name + ext)
-            if os.path.exists(candidate):
-                lr_path = candidate
+        for suffix in ['', 'x4', 'x2', '_x4', '_x2']:  # 支持多种命名格式
+            for ext in ['.png', '.jpg', '.jpeg']:
+                candidate = os.path.join(self.lr_dir, base_name + suffix + ext)
+                if os.path.exists(candidate):
+                    lr_path = candidate
+                    break
+            if lr_path:
                 break
         
         if lr_path is None:
@@ -96,32 +129,41 @@ class SRDataset(Dataset):
         
         lr_img = Image.open(lr_path).convert('RGB')
         
-        # Random crop from HR, corresponding crop from LR
-        crop_hr = self.resolution
-        crop_lr = self.resolution // 4
-        
-        W, H = hr_img.size
-        max_x = max(0, W - crop_hr)
-        max_y = max(0, H - crop_hr)
-        
-        # Use crop_idx for reproducibility within same image
-        torch.manual_seed(idx)
-        x = torch.randint(0, max_x + 1, (1,)).item() if max_x > 0 else 0
-        y = torch.randint(0, max_y + 1, (1,)).item() if max_y > 0 else 0
-        
-        # Crop HR
-        hr_crop = hr_img.crop((x, y, x + crop_hr, y + crop_hr))
-        
-        # Corresponding LR crop (4x downscale)
-        lr_x, lr_y = x // 4, y // 4
-        lr_crop = lr_img.crop((lr_x, lr_y, lr_x + crop_lr, lr_y + crop_lr))
-        
-        # Upsample LR to match HR resolution (bicubic)
-        lr_up = lr_crop.resize((self.resolution, self.resolution), Image.BICUBIC)
-        
-        # To tensor [-1, 1]
-        hr_t = torch.from_numpy(np.array(hr_crop)).permute(2, 0, 1).float() / 127.5 - 1
-        lr_t = torch.from_numpy(np.array(lr_up)).permute(2, 0, 1).float() / 127.5 - 1
+        if self.full_image:
+            # 🚀 整图模式：直接 resize 到目标分辨率
+            hr_resized = hr_img.resize((self.resolution, self.resolution), Image.BICUBIC)
+            lr_up = lr_img.resize((self.resolution, self.resolution), Image.BICUBIC)
+            
+            # To tensor [-1, 1]
+            hr_t = torch.from_numpy(np.array(hr_resized)).permute(2, 0, 1).float() / 127.5 - 1
+            lr_t = torch.from_numpy(np.array(lr_up)).permute(2, 0, 1).float() / 127.5 - 1
+        else:
+            # Random crop from HR, corresponding crop from LR
+            crop_hr = self.resolution
+            crop_lr = self.resolution // 4
+            
+            W, H = hr_img.size
+            max_x = max(0, W - crop_hr)
+            max_y = max(0, H - crop_hr)
+            
+            # Use crop_idx for reproducibility within same image
+            torch.manual_seed(idx)
+            x = torch.randint(0, max_x + 1, (1,)).item() if max_x > 0 else 0
+            y = torch.randint(0, max_y + 1, (1,)).item() if max_y > 0 else 0
+            
+            # Crop HR
+            hr_crop = hr_img.crop((x, y, x + crop_hr, y + crop_hr))
+            
+            # Corresponding LR crop (4x downscale)
+            lr_x, lr_y = x // 4, y // 4
+            lr_crop = lr_img.crop((lr_x, lr_y, lr_x + crop_lr, lr_y + crop_lr))
+            
+            # Upsample LR to match HR resolution (bicubic)
+            lr_up = lr_crop.resize((self.resolution, self.resolution), Image.BICUBIC)
+            
+            # To tensor [-1, 1]
+            hr_t = torch.from_numpy(np.array(hr_crop)).permute(2, 0, 1).float() / 127.5 - 1
+            lr_t = torch.from_numpy(np.array(lr_up)).permute(2, 0, 1).float() / 127.5 - 1
         
         return {'hr': hr_t, 'lr': lr_t}
 
@@ -150,10 +192,13 @@ class ValDataset(Dataset):
         hr_img = Image.open(hr_path).convert('RGB')
         
         lr_path = None
-        for ext in ['.png', '.jpg', '.jpeg']:
-            candidate = os.path.join(self.lr_dir, base_name + ext)
-            if os.path.exists(candidate):
-                lr_path = candidate
+        for suffix in ['', 'x4', 'x2', '_x4', '_x2']:  # 支持多种命名格式
+            for ext in ['.png', '.jpg', '.jpeg']:
+                candidate = os.path.join(self.lr_dir, base_name + suffix + ext)
+                if os.path.exists(candidate):
+                    lr_path = candidate
+                    break
+            if lr_path:
                 break
         if lr_path is None:
             lr_path = os.path.join(self.lr_dir, hr_name)
@@ -379,14 +424,27 @@ class DualStreamFLUXSR(nn.Module):
     def encode(self, img):
         """Encode image to latent"""
         img = img.to(self.vae.dtype).to(self.device)
-        lat = self.vae.encode(img).latent_dist.sample() * self.vae.config.scaling_factor
+        lat = self.vae.encode(img).latent_dist.sample()
+        
+        # 🌟 FLUX VAE 需要 shift_factor
+        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor is not None:
+            lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+        else:
+            lat = lat * self.vae.config.scaling_factor
         return lat
     
     @torch.no_grad()
     def decode(self, lat):
         """Decode latent to image"""
         lat = lat.to(self.device)
-        sample = self.vae.decode(lat / self.vae.config.scaling_factor).sample
+        
+        # 🌟 解码时加回 shift_factor
+        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor is not None:
+            lat = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        else:
+            lat = lat / self.vae.config.scaling_factor
+            
+        sample = self.vae.decode(lat).sample
         return sample
     
     def _pack(self, x):
@@ -436,8 +494,8 @@ class DualStreamFLUXSR(nn.Module):
         prompt = self.text_embeds['prompt'].expand(B, -1, -1)
         text_ids = self.text_embeds['text_ids']  # 2D tensor, 不需要 batch 维度
         
-        # Timestep
-        t_input = t.to(dtype) * 1000
+        # Timestep - FLUX 期望 [0, 1] 范围
+        t_input = t.to(dtype)
         
         # Guidance (for ControlNet conditioning strength)
         guidance_tensor = torch.full((B,), guidance, device=device, dtype=dtype)
@@ -485,7 +543,22 @@ class DualStreamFLUXSR(nn.Module):
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             self.model_name, subfolder="scheduler"
         )
-        scheduler.set_timesteps(num_steps, device=device)
+        
+        # 🌟 动态计算当前分辨率需要的 mu 参数
+        _, _, h_lat, w_lat = lr_lat.shape
+        # FLUX 打包后的序列长度是 (H/2) * (W/2)
+        image_seq_len = (h_lat // 2) * (w_lat // 2)
+        
+        mu = calculate_shift(
+            image_seq_len,
+            scheduler.config.base_image_seq_len,
+            scheduler.config.max_image_seq_len,
+            scheduler.config.base_shift,
+            scheduler.config.max_shift,
+        )
+        
+        # 传入 mu
+        scheduler.set_timesteps(num_steps, device=device, mu=mu)
         
         # Start from LR interpolation
         noise = torch.randn_like(lr_lat)
@@ -498,8 +571,12 @@ class DualStreamFLUXSR(nn.Module):
             timesteps = scheduler.timesteps
         
         for t in timesteps:
-            t_normalized = t / 1000.0 if t > 1 else t
-            t_batch = torch.full((B,), t_normalized, device=device, dtype=dtype)
+            # 🌟 安全归一化：确保传入 forward 的 t 永远在 [0, 1] 之间
+            t_val = t.item()
+            if t_val > 1.0:
+                t_val = t_val / scheduler.config.num_train_timesteps
+            
+            t_batch = torch.full((B,), t_val, device=device, dtype=dtype)
             
             v = self.forward(lat, lr_lat, lr_pixel, t_batch, guidance)
             lat = scheduler.step(v, t, lat, return_dict=False)[0]
@@ -511,7 +588,7 @@ class DualStreamFLUXSR(nn.Module):
 # Training Functions
 # ============================================================================
 
-def compute_flow_matching_loss(system, hr, lr, device, scheduler):
+def compute_flow_matching_loss(system, hr, lr, device, scheduler, debug=False):
     """Flow Matching Loss"""
     dtype = torch.bfloat16
     
@@ -536,11 +613,22 @@ def compute_flow_matching_loss(system, hr, lr, device, scheduler):
     
     pred_v = system(x_t, lr_lat, lr, t)
     
+    # 🔍 调试信息
+    if debug:
+        print(f"  [DEBUG] hr_lat range: [{hr_lat.min():.2f}, {hr_lat.max():.2f}]")
+        print(f"  [DEBUG] noise range: [{noise.min():.2f}, {noise.max():.2f}]")
+        print(f"  [DEBUG] target_v range: [{target_v.min():.2f}, {target_v.max():.2f}]")
+        print(f"  [DEBUG] pred_v range: [{pred_v.min():.2f}, {pred_v.max():.2f}]")
+        print(f"  [DEBUG] t values: {t.tolist()}")
+    
     loss = F.mse_loss(pred_v.float(), target_v.float())
     return loss
 
 
 def calculate_psnr(pred, target):
+    # 🌟 clamp 到 [-1, 1] 避免异常值影响 PSNR
+    pred = torch.clamp(pred, -1.0, 1.0)
+    
     mse = F.mse_loss(pred, target)
     if mse == 0:
         return float('inf')
@@ -565,6 +653,13 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
             lr_lat = unwrapped.encode(lr)
             sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, start_t=start_t)
             sr = unwrapped.decode(sr_lat)
+        
+        # 🔍 调试信息
+        if i == 0:
+            print(f"  [VAL DEBUG] hr range: [{hr.min():.2f}, {hr.max():.2f}]")
+            print(f"  [VAL DEBUG] sr range: [{sr.min():.2f}, {sr.max():.2f}]")
+            print(f"  [VAL DEBUG] hr_lat range: [{hr_lat.min():.2f}, {hr_lat.max():.2f}]")
+            print(f"  [VAL DEBUG] sr_lat range: [{sr_lat.min():.2f}, {sr_lat.max():.2f}]")
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
     
@@ -610,6 +705,8 @@ def main():
     
     parser.add_argument('--resolution', type=int, default=512)
     parser.add_argument('--num_crops', type=int, default=5, help='Number of random crops per image')
+    parser.add_argument('--full_image', action='store_true', default=False, 
+                        help='Use full image resize instead of random crops')
     parser.add_argument('--train_controlnet', action='store_true', default=True)
     parser.add_argument('--freeze_controlnet', action='store_true', default=False)
     parser.add_argument('--pixel_weight', type=float, default=1.0)
@@ -621,9 +718,9 @@ def main():
     parser.add_argument('--epochs', type=int, default=80)
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=1e-5)
-    parser.add_argument('--warmup_epochs', type=int, default=5)
+    parser.add_argument('--warmup_epochs', type=int, default=3)
     parser.add_argument('--val_interval', type=int, default=2)
-    parser.add_argument('--save_interval', type=int, default=10)
+    parser.add_argument('--save_interval', type=int, default=5)
     parser.add_argument('--val_steps', type=int, default=20)
     parser.add_argument('--start_t', type=float, default=0.8)
     
@@ -647,7 +744,10 @@ def main():
     torch.manual_seed(args.seed + local_rank)
     
     # Dataset
-    train_dataset = SRDataset(args.hr_dir, args.lr_dir, args.resolution, args.num_crops)
+    train_dataset = SRDataset(
+        args.hr_dir, args.lr_dir, args.resolution, 
+        num_crops=args.num_crops, full_image=args.full_image
+    )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=True
@@ -661,7 +761,8 @@ def main():
     # Output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode = "ctrl" if args.train_controlnet else "pix"
-    save_dir = os.path.join(args.output_dir, f"{timestamp}_{mode}_res{args.resolution}")
+    img_mode = "full" if args.full_image else f"crop{args.num_crops}"
+    save_dir = os.path.join(args.output_dir, f"{timestamp}_{mode}_res{args.resolution}_{img_mode}")
     
     if is_main:
         os.makedirs(save_dir, exist_ok=True)
@@ -674,6 +775,7 @@ def main():
             f.write(f"HR Dir: {args.hr_dir}\n")
             f.write(f"LR Dir: {args.lr_dir}\n")
             f.write(f"Resolution: {args.resolution}\n")
+            f.write(f"Image Mode: {'Full image resize' if args.full_image else f'{args.num_crops} crops per image'}\n")
             f.write(f"CLEAR: window={args.window_size}, down={args.down_factor}\n")
             f.write(f"Batch Size: {args.batch_size}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n")
@@ -685,6 +787,7 @@ def main():
         print(f"HR Dir: {args.hr_dir}")
         print(f"LR Dir: {args.lr_dir}")
         print(f"Resolution: {args.resolution}")
+        print(f"Image Mode: {'Full image resize' if args.full_image else f'{args.num_crops} crops per image'}")
         print(f"CLEAR: window={args.window_size}, down={args.down_factor}")
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
@@ -769,8 +872,11 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not is_main)
         
         for step, batch in enumerate(pbar):
+            # 🔍 第一个 epoch 的第一个 batch 打印调试信息
+            debug = (epoch == start_epoch and step == 0 and is_main)
+            
             loss = compute_flow_matching_loss(
-                accelerator.unwrap_model(system), batch['hr'], batch['lr'], device, noise_scheduler
+                accelerator.unwrap_model(system), batch['hr'], batch['lr'], device, noise_scheduler, debug=debug
             )
             
             accelerator.backward(loss)

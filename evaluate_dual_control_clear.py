@@ -21,6 +21,8 @@ for i, arg in enumerate(sys.argv):
 
 # 🌟 必须在导入 torch 之前设置这些环境变量
 os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+# 🚀 限制 Triton shared memory 使用，避免 OutOfResources
+os.environ["TRITON_NUM_STAGES"] = "2"
 os.environ["TORCH_LOGS"] = "-all"
 os.environ["TORCH_COMPILE_DEBUG"] = "0"
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torchinductor_cache"
@@ -72,34 +74,57 @@ except ImportError:
 
 
 # ============================================================================
+# FLUX Scheduler Helper
+# ============================================================================
+
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.16,
+):
+    """计算 FLUX scheduler 的动态 mu 参数"""
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
+
+
+# ============================================================================
 # Pixel Feature Extractor (与训练代码完全一致)
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
-    def __init__(self, latent_channels=16):
+    """Lightweight CNN to extract pixel-level features from LR image"""
+    
+    def __init__(self, in_channels=3, latent_channels=16):
         super().__init__()
-        
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 32), nn.SiLU(),
-            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 32), nn.SiLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64), nn.SiLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 64), nn.SiLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128), nn.SiLU(),
-            nn.Conv2d(128, latent_channels, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(4, latent_channels), nn.SiLU(),
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # /2
+            nn.SiLU(),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),  # /4
+            nn.SiLU(),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(256, 256, 3, stride=2, padding=1),  # /8
+            nn.SiLU(),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(256, latent_channels, 3, stride=2, padding=1),  # /16
         )
-        
-        self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
+        # Zero conv for stable training
+        self.zero_conv = nn.Conv2d(latent_channels, latent_channels, 1)
         nn.init.zeros_(self.zero_conv.weight)
         nn.init.zeros_(self.zero_conv.bias)
     
     def forward(self, x):
-        return self.zero_conv(self.encoder(x))
+        feat = self.net(x)
+        return self.zero_conv(feat)
 
 
 # ============================================================================
@@ -192,14 +217,12 @@ class DualStreamEvaluator:
         del text_enc, text_enc_2
         torch.cuda.empty_cache()
         gc.collect()
-        print("Text", end=" ", flush=True)
 
         # Load CLEAR Transformer
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
         self.transformer.requires_grad_(False)
-        print("Transformer", end=" ", flush=True)
 
         # Load ControlNet
         self.controlnet = FluxControlNetModel.from_pretrained(
@@ -213,12 +236,10 @@ class DualStreamEvaluator:
             self.controlnet.enable_xformers_memory_efficient_attention()
         except:
             pass
-        print("ControlNet", end=" ", flush=True)
         
         # Load Pixel Extractor
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.requires_grad_(False)
-        print("PixelNet", end=" ", flush=True)
         
         # 🌟 初始化 CLEAR
         dummy_patch_size = 32  # 对应 512x512
@@ -262,7 +283,6 @@ class DualStreamEvaluator:
         # 统计
         clear_count = sum(1 for k in trans_attn_processors if k.startswith("transformer_blocks"))
         native_count = len(trans_attn_processors) - clear_count
-        print(f"CLEAR({clear_count}) Native({native_count})", end=" ", flush=True)
         
         # 🌟 加载 CLEAR 预训练权重
         if os.path.exists(self.clear_ckpt):
@@ -368,7 +388,14 @@ class DualStreamEvaluator:
         # 🌟 VAE CPU-GPU 调度：用时搬到 GPU，用完踢回 CPU
         self.vae.to(self.device)
         img_tensor = img.to(self.vae.dtype).to(self.device)
-        lat = self.vae.encode(img_tensor).latent_dist.sample() * self.vae.config.scaling_factor
+        lat = self.vae.encode(img_tensor).latent_dist.sample()
+        
+        # 🌟 FLUX VAE 需要 shift_factor
+        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor is not None:
+            lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+        else:
+            lat = lat * self.vae.config.scaling_factor
+        
         self.vae.to("cpu")
         torch.cuda.empty_cache()
         return lat
@@ -378,7 +405,14 @@ class DualStreamEvaluator:
         # 🌟 VAE CPU-GPU 调度：用时搬到 GPU，用完踢回 CPU
         self.vae.to(self.device)
         lat = lat.to(self.device)
-        sample = self.vae.decode(lat / self.vae.config.scaling_factor).sample
+        
+        # 🌟 解码时加回 shift_factor
+        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor is not None:
+            lat = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        else:
+            lat = lat / self.vae.config.scaling_factor
+            
+        sample = self.vae.decode(lat).sample
         self.vae.to("cpu")
         torch.cuda.empty_cache()
         return sample
@@ -471,7 +505,22 @@ class DualStreamEvaluator:
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             self.model_name, subfolder="scheduler"
         )
-        scheduler.set_timesteps(num_steps, device=device)
+        
+        # 🌟 动态计算当前分辨率需要的 mu 参数
+        _, _, h_lat, w_lat = lr_lat.shape
+        # FLUX 打包后的序列长度是 (H/2) * (W/2)
+        image_seq_len = (h_lat // 2) * (w_lat // 2)
+        
+        mu = calculate_shift(
+            image_seq_len,
+            scheduler.config.base_image_seq_len,
+            scheduler.config.max_image_seq_len,
+            scheduler.config.base_shift,
+            scheduler.config.max_shift,
+        )
+        
+        # 传入 mu
+        scheduler.set_timesteps(num_steps, device=device, mu=mu)
         
         # 🚀 关键：从 LR 插值开始，而非纯噪声
         noise = torch.randn_like(lr_lat)
@@ -488,9 +537,12 @@ class DualStreamEvaluator:
         
         # 去噪循环
         for t in timesteps:
-            # FLUX 使用 [0, 1] 范围的 t
-            t_normalized = t / 1000.0 if t > 1 else t
-            t_batch = torch.full((B,), t_normalized, device=device, dtype=dtype)
+            # 🌟 安全归一化：确保传入 forward 的 t 永远在 [0, 1] 之间
+            t_val = t.item()
+            if t_val > 1.0:
+                t_val = t_val / scheduler.config.num_train_timesteps
+            
+            t_batch = torch.full((B,), t_val, device=device, dtype=dtype)
             
             # 预测 velocity
             v = self.forward(lat, lr_lat, lr_pixel, t_batch, guidance)
@@ -603,8 +655,6 @@ def main():
         lpips_fn.eval()
     
     hr_files = sorted([f for f in os.listdir(args.hr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    lr_files = sorted([f for f in os.listdir(args.lr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    assert len(hr_files) == len(lr_files)
     
     print(f"\nEvaluating {len(hr_files)} images...\n")
     
@@ -612,12 +662,25 @@ def main():
     psnr_bic_list, ssim_bic_list, lpips_bic_list = [], [], []
     filenames = []
     
-    for hf, lf in tqdm(zip(hr_files, lr_files), total=len(hr_files), desc="Evaluating"):
+    for hf in tqdm(hr_files, desc="Evaluating"):
         base_name = os.path.splitext(hf)[0]
         filenames.append(base_name)
         
+        # 查找对应的 LR 文件
+        lr_path = None
+        for suffix in ['', 'x4', 'x2', '_x4', '_x2']:
+            for ext in ['.png', '.jpg', '.jpeg']:
+                candidate = os.path.join(args.lr_dir, base_name + suffix + ext)
+                if os.path.exists(candidate):
+                    lr_path = candidate
+                    break
+            if lr_path:
+                break
+        if lr_path is None:
+            lr_path = os.path.join(args.lr_dir, hf)
+        
         hr_img = Image.open(os.path.join(args.hr_dir, hf)).convert('RGB')
-        lr_img = Image.open(os.path.join(args.lr_dir, lf)).convert('RGB')
+        lr_img = Image.open(lr_path).convert('RGB')
         
         if args.force_512:
             W, H = 512, 512
