@@ -170,8 +170,8 @@ class DualStreamEvaluator:
         self._current_mask_size = None
     
     def load(self):
-        from transformer_flux import FluxTransformer2DModel  # 🌟 使用 CLEAR 版本
-        from diffusers import AutoencoderKL, FluxControlNetModel
+        # from transformer_flux import   # 🌟 使用 CLEAR 版本
+        from diffusers import AutoencoderKL, FluxControlNetModel, FluxTransformer2DModel
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
         from safetensors.torch import load_file
         from attention_processor import (
@@ -260,34 +260,33 @@ class DualStreamEvaluator:
                 window_size=self.window_size, device=device_str
             )
         
-        # 🌟 修复：精准投递 CLEAR，只对双流模块使用，单流模块保留原生！
+        # 🌟 严格对齐训练脚本：按模块安全加载 CLEAR Processor 和 Weights
         dtype = torch.bfloat16
-        original_processors = self.transformer.attn_processors
-        trans_attn_processors = {}
-        
-        for k, proc in original_processors.items():
-            if k.startswith("transformer_blocks"):
-                # 只有双流模块换上 CLEAR（这些有预训练权重）
-                if self.down_factor > 1:
-                    trans_attn_processors[k] = LocalDownsampleFlexAttnProcessor(
-                        down_factor=self.down_factor
-                    ).to(self.device, dtype)
-                else:
-                    trans_attn_processors[k] = LocalFlexAttnProcessor()
-            else:
-                # 🌟 极其重要：single_transformer_blocks 必须保留原生处理器！
-                trans_attn_processors[k] = proc
-        
-        self.transformer.set_attn_processor(trans_attn_processors)
-        
-        # 统计
-        clear_count = sum(1 for k in trans_attn_processors if k.startswith("transformer_blocks"))
-        native_count = len(trans_attn_processors) - clear_count
-        
-        # 🌟 加载 CLEAR 预训练权重
         if os.path.exists(self.clear_ckpt):
-            clear_state_dict = load_file(self.clear_ckpt)
-            self.transformer.load_state_dict(clear_state_dict, strict=False)
+            from safetensors.torch import load_file
+            clear_weights = load_file(self.clear_ckpt)
+            
+            for name, module in self.transformer.named_modules():
+                if hasattr(module, 'set_processor') and 'transformer_blocks.' in name and 'single' not in name:
+                    block_idx = int(name.split('transformer_blocks.')[1].split('.')[0])
+                    prefix = f"transformer_blocks.{block_idx}.attn."
+                    
+                    block_weights = {
+                        k.replace(prefix, ''): v.to(dtype)
+                        for k, v in clear_weights.items()
+                        if k.startswith(prefix)
+                    }
+                    
+                    if block_weights:
+                        if self.down_factor > 1:
+                            processor = LocalDownsampleFlexAttnProcessor(down_factor=self.down_factor)
+                        else:
+                            processor = LocalFlexAttnProcessor()
+                            
+                        # 🌟 关键：只把权重加载给 processor，绝不污染 Transformer 的 QKV！
+                        processor.load_state_dict(block_weights, strict=False)
+                        processor = processor.to(self.device, dtype)
+                        module.set_processor(processor)
         else:
             raise FileNotFoundError(f"CLEAR checkpoint not found: {self.clear_ckpt}")
         
@@ -299,10 +298,20 @@ class DualStreamEvaluator:
             if 'pixel_weight' in ckpt:
                 self.pixel_weight = ckpt['pixel_weight']
             
-            # 加载 Pixel Extractor
+            # 🔍 调试：检查 checkpoint 中 pixel_extractor 的 keys
             if 'pixel_extractor' in ckpt:
+                print(f"\n[DEBUG] Checkpoint pixel_extractor keys: {list(ckpt['pixel_extractor'].keys())[:5]}...")
+                
+                # 检查 zero_conv 权重
+                for k, v in ckpt['pixel_extractor'].items():
+                    if 'zero_conv' in k:
+                        print(f"  {k}: shape={v.shape}, range=[{v.min():.4f}, {v.max():.4f}]")
+                
                 state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
                 self.pixel_extractor.load_state_dict(state)
+                
+                # 🔍 验证加载后的权重
+                print(f"  Loaded zero_conv.weight range: [{self.pixel_extractor.zero_conv.weight.min():.4f}, {self.pixel_extractor.zero_conv.weight.max():.4f}]")
             
             # 加载 ControlNet
             if 'controlnet' in ckpt:
@@ -429,12 +438,29 @@ class DualStreamEvaluator:
         lr_pixel = lr_pixel.to(dtype)
         t = t.to(dtype)
         
+        # 🔍 调试信息（只打印一次）
+        if not hasattr(self, '_forward_debug_printed'):
+            print(f"\n[FORWARD DEBUG]")
+            print(f"  noisy shape: {noisy.shape}, range: [{noisy.min():.2f}, {noisy.max():.2f}]")
+            print(f"  lr_lat shape: {lr_lat.shape}, range: [{lr_lat.min():.2f}, {lr_lat.max():.2f}]")
+            print(f"  lr_pixel shape: {lr_pixel.shape}, range: [{lr_pixel.min():.2f}, {lr_pixel.max():.2f}]")  # 检查输入
+            print(f"  t: {t}")
+            self._forward_debug_printed = True
+        
         prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         pooled = self._cached_embeds['pooled'].expand(B, -1)
         txt_ids = self._cached_embeds['text_ids']
         img_ids = self._img_ids(H, W, device, dtype)
         
         pixel_feat = self.pixel_extractor(lr_pixel).to(dtype)
+        
+        # 🔍 检查 pixel_extractor 的中间输出
+        if not hasattr(self, '_pixel_debug_printed'):
+            with torch.no_grad():
+                net_out = self.pixel_extractor.net(lr_pixel)
+                print(f"  pixel_extractor.net output range: [{net_out.min():.2f}, {net_out.max():.2f}]")
+                print(f"  zero_conv.weight range: [{self.pixel_extractor.zero_conv.weight.min():.4f}, {self.pixel_extractor.zero_conv.weight.max():.4f}]")
+            self._pixel_debug_printed = True
         
         # 🚀 修复尺寸不匹配：PixelExtractor 输出 /16，VAE latent 是 /8
         if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
@@ -444,38 +470,52 @@ class DualStreamEvaluator:
         
         fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
         
+        # 🔍 调试信息（只打印一次）
+        if not hasattr(self, '_fused_debug_printed'):
+            print(f"  pixel_feat range: [{pixel_feat.min():.2f}, {pixel_feat.max():.2f}]")
+            print(f"  fused_cond range: [{fused_cond.min():.2f}, {fused_cond.max():.2f}]")
+            print(f"  pixel_weight: {self.pixel_weight}")
+            self._fused_debug_printed = True
+        
         packed_noisy = self._pack(noisy)
         packed_cond = self._pack(fused_cond)
         
-        # ControlNet
+        # ControlNet（参数顺序与训练脚本一致）
+        guidance_tensor = torch.full((B,), guidance, device=device, dtype=dtype)
         ctrl_out = self.controlnet(
             hidden_states=packed_noisy,
             controlnet_cond=packed_cond,
             timestep=t,
-            encoder_hidden_states=prompt,
+            guidance=guidance_tensor,
             pooled_projections=pooled,
+            encoder_hidden_states=prompt,
             txt_ids=txt_ids,
             img_ids=img_ids,
-            guidance=torch.full((B,), guidance, device=device, dtype=dtype),
             return_dict=False,
         )
         
-        ctrl_block_samples = [x.to(dtype) for x in ctrl_out[0]] if ctrl_out[0] else None
-        ctrl_single_samples = [x.to(dtype) for x in ctrl_out[1]] if ctrl_out[1] else None
+        ctrl_block_samples = ctrl_out[0]
+        ctrl_single_samples = ctrl_out[1]
         
-        # Transformer (with CLEAR attention)
+        # Transformer (with CLEAR attention)（参数顺序与训练脚本一致）
         pred = self.transformer(
             hidden_states=packed_noisy,
             timestep=t,
-            encoder_hidden_states=prompt,
+            guidance=guidance_tensor,
             pooled_projections=pooled,
+            encoder_hidden_states=prompt,
             txt_ids=txt_ids,
             img_ids=img_ids,
-            guidance=torch.full((B,), guidance, device=device, dtype=dtype),
             controlnet_block_samples=ctrl_block_samples,
             controlnet_single_block_samples=ctrl_single_samples,
             return_dict=False,
         )[0]
+        
+        # 🔍 调试输出（只打印一次）
+        if not hasattr(self, '_pred_debug_printed'):
+            unpacked = self._unpack(pred, H, W)
+            print(f"  pred (velocity) range: [{unpacked.min():.2f}, {unpacked.max():.2f}]")
+            self._pred_debug_printed = True
         
         return self._unpack(pred, H, W)
     
@@ -522,25 +562,50 @@ class DualStreamEvaluator:
         # 传入 mu
         scheduler.set_timesteps(num_steps, device=device, mu=mu)
         
+        # 🔍 调试输出（只在第一次调用时打印）
+        if not hasattr(self, '_inference_debug_printed'):
+            print(f"\n[DEBUG] Inference setup:")
+            print(f"  scheduler.timesteps range: [{scheduler.timesteps.min().item():.4f}, {scheduler.timesteps.max().item():.4f}]")
+            print(f"  scheduler.config.num_train_timesteps: {scheduler.config.num_train_timesteps}")
+            print(f"  mu: {mu:.4f}")
+            self._inference_debug_printed = True
+        
         # 🚀 关键：从 LR 插值开始，而非纯噪声
         noise = torch.randn_like(lr_lat)
         if start_t < 1.0:
-            # SR 模式：从 LR 和噪声的插值开始
-            lat = start_t * noise + (1 - start_t) * lr_lat
-            # 跳过前面的 timesteps
             start_idx = int((1.0 - start_t) * num_steps)
             timesteps = scheduler.timesteps[start_idx:]
+            
+            # 🌟 获取第一个 timestep 对应的真实 t 值
+            # scheduler.timesteps 可能是 [0, 1] 或 [0, 1000] 范围
+            first_t = timesteps[0].item()
+            actual_start_t = first_t / scheduler.config.num_train_timesteps if first_t > 1.0 else first_t
+            
+            # 🔍 调试输出
+            if not hasattr(self, '_start_t_debug_printed'):
+                print(f"  start_t: {start_t}, start_idx: {start_idx}")
+                print(f"  first_t (raw): {first_t:.4f}")
+                print(f"  actual_start_t (normalized): {actual_start_t:.4f}")
+                self._start_t_debug_printed = True
+            
+            # 使用真实的 t 进行插值，对接 ODE Solver
+            lat = actual_start_t * noise + (1 - actual_start_t) * lr_lat
         else:
-            # 标准模式：从纯噪声开始
             lat = noise * scheduler.init_noise_sigma
             timesteps = scheduler.timesteps
         
         # 去噪循环
-        for t in timesteps:
-            # 🌟 安全归一化：确保传入 forward 的 t 永远在 [0, 1] 之间
+        for i, t in enumerate(timesteps):
+            # 🌟 统一归一化：确保传入 forward 的 t 永远在 [0, 1] 之间
             t_val = t.item()
             if t_val > 1.0:
                 t_val = t_val / scheduler.config.num_train_timesteps
+            
+            # 🔍 第一步调试
+            if i == 0 and not hasattr(self, '_denoise_debug_printed'):
+                print(f"  First denoise step: raw_t={t.item():.4f}, normalized_t={t_val:.4f}")
+                print(f"  lat range before: [{lat.min().item():.2f}, {lat.max().item():.2f}]")
+                self._denoise_debug_printed = True
             
             t_batch = torch.full((B,), t_val, device=device, dtype=dtype)
             
@@ -549,6 +614,11 @@ class DualStreamEvaluator:
             
             # scheduler.step 执行更新
             lat = scheduler.step(v, t, lat, return_dict=False)[0]
+            
+            # 🔍 最后一步调试
+            if i == len(timesteps) - 1 and not hasattr(self, '_final_debug_printed'):
+                print(f"  Final step: lat range: [{lat.min().item():.2f}, {lat.max().item():.2f}]")
+                self._final_debug_printed = True
         
         return lat
 
